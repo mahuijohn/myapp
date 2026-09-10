@@ -1,0 +1,39 @@
+# Android Studio / IntelliJ user state
+*.iml
+/.idea/caches/
+/.idea/libraries/
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+/.idea/tasks.xml
+/.idea/shelf/
+
+# Gradle, Kotlin, and Android build output
+.gradle/
+.kotlin/
+**/build/
+**/.externalNativeBuild/
+**/.cxx/
+
+# Machine-specific Android SDK configuration
+/local.properties
+
+# Generated Android artifacts
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+/captures/
+
+# Local signing credentials and secrets
+*.jks
+*.keystore
+*.pem
+keystore.properties
+signing.properties
+secrets.properties
+
+# macOS Finder metadata
+.DS_Store
