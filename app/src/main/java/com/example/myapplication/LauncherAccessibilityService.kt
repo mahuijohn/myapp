@@ -205,6 +205,14 @@ class LauncherAccessibilityService : AccessibilityService() {
     private var runStartedAt = 0L
     private var watchdogDeadline = 0L
     private var currentTaskTitle: String? = null
+    /**
+     * True when the current task matches the user's app-switch list, i.e. its destination swallows
+     * BACK. Decided once in [startTask], while the row's description and button text are still in
+     * hand, because only the title survives into the return path.
+     */
+    private var currentTaskReturnsByAppSwitch = false
+    /** Guards the one-shot hand-off from the in-app BACK ladder to the app-switch path. */
+    private var appSwitchReturnDelegated = false
     /** Dedicated interaction state for titles matching 关注…星球号. */
     private enum class PlanetFollowState { IDLE, WAITING_FOR_CONTROL, RETURNING }
     private var planetFollowState = PlanetFollowState.IDLE
@@ -791,6 +799,8 @@ class LauncherAccessibilityService : AccessibilityService() {
             resetMiniProgramSession()
         }
         currentTaskTitle = null
+        currentTaskReturnsByAppSwitch = false
+        appSwitchReturnDelegated = false
         planetFollowState = PlanetFollowState.IDLE
         planetFollowDeadlineMs = 0L
         hotelRankingState = HotelRankingState.IDLE
@@ -1299,6 +1309,8 @@ class LauncherAccessibilityService : AccessibilityService() {
             finalClaimPasses = 0
             expectingExternalApp = false
             capturingTaskApps = false
+            currentTaskReturnsByAppSwitch = false
+            appSwitchReturnDelegated = false
             planetFollowState = PlanetFollowState.IDLE
             planetFollowDeadlineMs = 0L
             hotelRankingState = HotelRankingState.IDLE
@@ -4412,6 +4424,12 @@ class LauncherAccessibilityService : AccessibilityService() {
         val dailyCashNoteTask = isDailyCashNoteTask(row)
         processedTasks.add(row.title)
         currentTaskTitle = row.title
+        currentTaskReturnsByAppSwitch = AutomationSettings.matchesAppSwitchReturn(
+            row.title,
+            row.description,
+            row.buttonText,
+        )
+        appSwitchReturnDelegated = false
         planetFollowState = if (planetFollowTask) {
             PlanetFollowState.WAITING_FOR_CONTROL
         } else {
@@ -4514,6 +4532,13 @@ class LauncherAccessibilityService : AccessibilityService() {
                         )
                 }
             }
+        }
+
+        if (currentTaskReturnsByAppSwitch) {
+            logProgress(
+                "'${row.title}' matches the app-switch list, so it will return to $TASK_PAGE_TITLE by " +
+                        "switching apps instead of going back"
+            )
         }
 
         // Suppress interruption handling while the task destination is in flight. Dedicated in-app
@@ -5902,6 +5927,18 @@ class LauncherAccessibilityService : AccessibilityService() {
 
         val targetInFront = foregroundPackage() == targetPackageName && targetAppRoot() != null
         val externalApp = confirmedExternalTaskApp
+        // A destination on the user's app-switch list consumes BACK, so both BACK ladders would only
+        // burn their retries in it. Go straight to HOME/Recents, which the app cannot intercept.
+        // Deliberately not gated on a *confirmed* external package: an unconfirmed one still leaves us
+        // stuck outside 携程, which is exactly the case this list exists for.
+        if (!targetInFront && currentTaskReturnsByAppSwitch) {
+            logProgress(
+                "Task done in ${externalApp ?: readableExternalTaskPackage() ?: "the task app"}, " +
+                        "which is set to ignore BACK; switching apps to return"
+            )
+            switchBackToTargetApp()
+            return
+        }
         if (targetInFront || externalApp == null) {
             // Internal Ctrip pages use BACK. If an external package was observed but never confirmed
             // (common for opaque WeChat mini-program windows), preserve taskApps: once BACK reaches
@@ -5973,8 +6010,21 @@ class LauncherAccessibilityService : AccessibilityService() {
             "BACK did not reveal Ctrip after $MAX_EXTERNAL_BACK_PRESSES attempts; " +
                     "falling back to HOME for $externalApp"
         )
+        switchBackToTargetApp()
+    }
+
+    /**
+     * Returns to 携程 without asking the task app for anything: HOME, then either its Recents card is
+     * dismissed on the way back or 携程 is switched to directly.
+     *
+     * HOME is a global action the system performs itself rather than dispatching to the focused
+     * window, so unlike BACK and the edge swipes an app cannot swallow it. This is both the bounded
+     * fallback after the BACK ladder and the whole return path for tasks on the app-switch list.
+     */
+    private fun switchBackToTargetApp() {
         try { performGlobalAction(GLOBAL_ACTION_HOME) } catch (_: Exception) {}
         mainHandler.postDelayed({
+            if (manualInterruptionDetected) return@postDelayed
             if (taskApps.any { isSafeToKill(it) }) {
                 closeTaskAppsViaRecentsThenReturn()
             } else {
@@ -6426,6 +6476,21 @@ class LauncherAccessibilityService : AccessibilityService() {
             markCurrentTaskDone(TASK_OUTCOME_DONE)
             logProgress("Back on $TASK_PAGE_TITLE")
             mainHandler.postDelayed({ resumeTaskLoop() }, randomDelay(1000, 1600))
+            return
+        }
+
+        // Reaching here outside 携程 on an app-switch task means the destination is still on top, and
+        // it is one that eats BACK. Hand off to the app-switch path once rather than spending the
+        // ladder on it. One-shot, so a failed hand-off cannot bounce between the two routes.
+        if (currentTaskReturnsByAppSwitch &&
+            !appSwitchReturnDelegated &&
+            foregroundPackage() != targetPackageName
+        ) {
+            appSwitchReturnDelegated = true
+            logProgress(
+                "'${currentTaskTitle.orEmpty()}' ignores BACK; switching apps to reach $TASK_PAGE_TITLE"
+            )
+            switchBackToTargetApp()
             return
         }
 
