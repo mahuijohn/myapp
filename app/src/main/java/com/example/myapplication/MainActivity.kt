@@ -856,6 +856,8 @@ fun AccessibilityScreen(modifier: Modifier = Modifier) {
     val skipTexts by AutomationSettings.skipTexts.collectAsState()
     val whitelistTextsRaw by AutomationSettings.whitelistTextsRaw.collectAsState()
     val whitelistTexts by AutomationSettings.whitelistTexts.collectAsState()
+    val appSwitchTextsRaw by AutomationSettings.appSwitchTextsRaw.collectAsState()
+    val appSwitchTexts by AutomationSettings.appSwitchTexts.collectAsState()
 
     Column(
         modifier = modifier
@@ -984,6 +986,43 @@ fun AccessibilityScreen(modifier: Modifier = Modifier) {
             } else {
                 "${skipTexts.size} entr${if (skipTexts.size == 1) "y" else "ies"}: " +
                         skipTexts.joinToString(" · ")
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.align(Alignment.Start).padding(top = 8.dp)
+        )
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 24.dp))
+
+        Text(
+            text = "Switch-apps return text match",
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.align(Alignment.Start)
+        )
+        Text(
+            text = "One entry per line, or separated by commas. Matched against each task's title, " +
+                    "description and button. Use it for destinations that ignore the back gesture: " +
+                    "after the award, those tasks return to 携程旅行 by switching apps (home, then the " +
+                    "app's recents card or a relaunch) instead of pressing back.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.align(Alignment.Start).padding(top = 4.dp, bottom = 8.dp)
+        )
+        OutlinedTextField(
+            value = appSwitchTextsRaw,
+            onValueChange = { AutomationSettings.setAppSwitchTextsRaw(it) },
+            label = { Text("Switch-apps texts") },
+            placeholder = { Text(AutomationSettings.DEFAULT_APP_SWITCH) },
+            minLines = 3,
+            maxLines = 6,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Text(
+            text = if (appSwitchTexts.isEmpty()) {
+                "No entries — every task returns with the back gesture first."
+            } else {
+                "${appSwitchTexts.size} entr${if (appSwitchTexts.size == 1) "y" else "ies"}: " +
+                        appSwitchTexts.joinToString(" · ")
             },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
