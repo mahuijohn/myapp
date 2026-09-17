@@ -143,6 +143,10 @@ class LauncherAccessibilityService : AccessibilityService() {
     /** Startup-only recovery; it never records task completion. */
     private var startupRecoveryActive = false
     private var startupBackPresses = 0
+    /** Times this run has reopened the app after a failure left us on the home screen. */
+    private var launcherRescues = 0
+    /** One failure can reach two rescue hooks, so the spent-budget notice is only worth saying once. */
+    private var launcherRescueBudgetLogged = false
     private var startupUnknownSignature: Set<String> = emptySet()
     private var startupUnknownHits = 0
     private var startupUnreadablePolls = 0
@@ -372,6 +376,19 @@ class LauncherAccessibilityService : AccessibilityService() {
     /** Package of the front-most readable window, or null when no window content is available. */
     private fun foregroundPackage(): String? =
         currentRoots().firstNotNullOfOrNull { it.packageName?.toString() }
+
+    /**
+     * True when the front-most window is the home screen rather than any app.
+     *
+     * The system UI counts as well: right after HOME the launcher can still be reported under
+     * com.android.systemui, and Recents lives there too. Either way the app is merely gone from the
+     * front, which is recoverable, unlike a page the flow genuinely cannot read.
+     */
+    private fun isOnLauncherHome(): Boolean {
+        val front = foregroundPackage() ?: return false
+        if (front == targetPackageName || front == packageName) return false
+        return front == launcherPackage || front == "com.android.systemui"
+    }
 
     /** Whether the user has enabled this service under Settings > Accessibility. */
     private fun isAccessibilityServiceEnabled(): Boolean {
@@ -719,6 +736,8 @@ class LauncherAccessibilityService : AccessibilityService() {
             if (!runActive) return
             if (SystemClock.uptimeMillis() > watchdogDeadline) {
                 onRunStalled()
+                // A rescue leaves the run alive, so the watchdog has to keep guarding it.
+                if (runActive) mainHandler.postDelayed(this, WATCHDOG_TICK_MS)
                 return
             }
             mainHandler.postDelayed(this, WATCHDOG_TICK_MS)
@@ -740,6 +759,9 @@ class LauncherAccessibilityService : AccessibilityService() {
      */
     private fun onRunStalled() {
         if (!runActive) return
+        // Checked before the run is torn down: a stall parked on the home screen means the app was
+        // lost, and reopening it needs runActive still true and no interruption flag set.
+        if (rescueFromLauncherHome("no progress for ${STALL_TIMEOUT_MS / 1000}s")) return
         runActive = false
         val where = foregroundPackage()
         logProgress("No progress for ${STALL_TIMEOUT_MS / 1000}s (foreground: $where) — stopping")
@@ -828,13 +850,140 @@ class LauncherAccessibilityService : AccessibilityService() {
     private fun failCurrentTaskWithScreenshot(reason: String, afterCapture: () -> Unit) {
         val title = currentTaskTitle
         if (title == null) {
+            if (rescueFromLauncherHome(reason)) return
             afterCapture()
             return
         }
         noteProgress(FAILURE_SCREENSHOT_TIMEOUT_MS)
         val entryId = AutomationLog.beginTaskFailure(title, reason)
         markCurrentTaskDone(reason)
+        // A shot of the home screen documents nothing, and being there means the app was merely lost
+        // rather than the flow being broken. Reopen it and carry on instead of ending the run.
+        if (rescueFromLauncherHome(reason, entryId)) return
         captureFailureScreenshot(entryId, afterCapture)
+    }
+
+    /**
+     * Last chance before a failure ends the run: if we are sitting on the home screen, the app was
+     * only lost, so reopen it the way the first step of the run does and pick the flow back up.
+     *
+     * Returns true when a rescue was started, in which case the caller must not continue failing.
+     * Everything that identifies work already done — [processedTasks], [tasksStarted], [taskResults],
+     * [actionLog] — is deliberately preserved, so the resumed flow skips what it has already run and
+     * the summary still covers the whole run. Bounded by [MAX_LAUNCHER_RESCUES] so a home screen the
+     * app cannot be reopened from cannot loop.
+     *
+     * [failedScreenshotEntryId], when given, is the pending failure entry whose screenshot is being
+     * skipped, so the log says why no image was attached.
+     */
+    private fun rescueFromLauncherHome(reason: String, failedScreenshotEntryId: Long? = null): Boolean {
+        if (activeAutomationMode != AutomationMode.COLLECT_AWARDS) return false
+        if (!runActive || manualInterruptionDetected) return false
+        if (taskLoopPhase == TaskLoopPhase.FINISHED) return false
+        if (targetPackageName == null || !isOnLauncherHome()) return false
+        if (launcherRescues >= MAX_LAUNCHER_RESCUES) {
+            if (!launcherRescueBudgetLogged) {
+                launcherRescueBudgetLogged = true
+                logProgress(
+                    "On the home screen after $reason, but the $MAX_LAUNCHER_RESCUES-rescue budget " +
+                            "is spent"
+                )
+            }
+            return false
+        }
+
+        launcherRescues++
+        logProgressSection(
+            "Rescue $launcherRescues/$MAX_LAUNCHER_RESCUES: on the home screen after $reason; " +
+                    "reopening $targetPackageName to resume the run"
+        )
+        if (!reopenTargetFromLauncher()) {
+            logProgress("Could not reopen $targetPackageName from the home screen")
+            return false
+        }
+        if (failedScreenshotEntryId != null) {
+            AutomationLog.failScreenshot(
+                failedScreenshotEntryId,
+                "skipped: the home screen was in front, so the app was reopened instead"
+            )
+        }
+        // Record an interrupted task before the resumed flow can start a different one.
+        if (currentTaskTitle != null) markCurrentTaskDone(reason) else resetMiniProgramSession()
+
+        // Same reset as a fresh launch, minus everything that remembers what this run already did.
+        mineFlowStarted = false
+        shouldClickElement = true
+        clickAttempts = 0
+        currentDelayMs = 500L
+        startupRecoveryActive = false
+        startupBackPresses = 0
+        startupUnknownSignature = emptySet()
+        startupUnknownHits = 0
+        startupUnreadablePolls = 0
+        stepClicksIndex = -1
+        stepClicks = 0
+        taskEntryStepState = TaskEntryStepState.IDLE
+        taskEntryStepDeadlineMs = 0L
+        lastChooserClickAt = 0L
+        taskScrolls = 0
+        lastPageSignature = emptySet()
+        expectingExternalApp = false
+        capturingTaskApps = false
+        currentTaskReturnsByAppSwitch = false
+        appSwitchReturnDelegated = false
+        taskAppCleanupToken++
+        taskAppCleanupInProgress = false
+        taskApps.clear()
+        externalTaskCandidate = null
+        externalTaskCandidateHits = 0
+        confirmedExternalTaskApp = null
+        clearExternalHandoffState()
+        // The claim/rescan state machine cannot be resumed mid-phase, so restart its scan. Its
+        // MAX_FINAL_CLAIM_PASSES budget is preserved, which is what keeps that bounded.
+        taskLoopPhase = TaskLoopPhase.SCANNING
+
+        // Lands in startMineFlowOnce → resumeOrRecoverStartup, which classifies whatever page Ctrip
+        // restores and re-enters the flow at that point rather than from the beginning.
+        mainHandler.postDelayed({ awaitTargetAppForeground() }, randomDelay(800, 1400))
+        return true
+    }
+
+    /**
+     * Reopens the target app from the home screen, preferring a tap on its icon.
+     *
+     * The tap is an accessibility click on the launcher, so unlike `startActivity` it needs no
+     * background-launch permission (MIUI's 后台弹出界面) — the same reason [bringBackTargetApp] tries
+     * Recents before a relaunch. The launch intent remains the fallback for a home screen whose
+     * current page does not show the icon.
+     */
+    private fun reopenTargetFromLauncher(): Boolean {
+        val label = targetLabel
+        val icon = if (label == null) null else currentRoots()
+            .asSequence()
+            .filter { root ->
+                val rootPackage = root.packageName?.toString()
+                rootPackage == launcherPackage || rootPackage == "com.android.systemui"
+            }
+            .flatMap { collectTextNodes(it).asSequence() }
+            // Exact match only: an icon's label is the app name, while a widget or search suggestion
+            // merely containing it would open something else entirely.
+            .firstOrNull { it.text.trim() == label }
+        if (icon != null) {
+            val clickable = clickableSelfOrAncestor(icon.node, maxDepth = 5)
+            val clicked =
+                if (clickable != null) tryPerformClick(clickable) else tryClickRect(icon.bounds)
+            if (clicked) {
+                recordAction("Tapped the '$label' icon on the home screen")
+                return true
+            }
+            logProgress("Found the '$label' icon on the home screen but could not tap it")
+        }
+
+        val pkg = targetPackageName ?: return false
+        if (packageManager.getLaunchIntentForPackage(pkg) == null) return false
+        logProgress("No tappable '$label' icon on the home screen; launching $pkg by intent")
+        relaunchTargetApp()
+        return true
     }
 
     private fun captureFailureScreenshot(entryId: Long, continuation: () -> Unit) {
@@ -1166,6 +1315,8 @@ class LauncherAccessibilityService : AccessibilityService() {
         startupUnknownSignature = emptySet()
         startupUnknownHits = 0
         startupUnreadablePolls = 0
+        launcherRescues = 0
+        launcherRescueBudgetLogged = false
         lastChooserClickAt = 0L
         initialTaskListDumped = false
         actionLog.clear()
@@ -1293,6 +1444,8 @@ class LauncherAccessibilityService : AccessibilityService() {
             startupUnknownSignature = emptySet()
             startupUnknownHits = 0
             startupUnreadablePolls = 0
+            launcherRescues = 0
+            launcherRescueBudgetLogged = false
             stepClicksIndex = -1
             stepClicks = 0
             taskEntryStepState = TaskEntryStepState.IDLE
@@ -4119,6 +4272,11 @@ class LauncherAccessibilityService : AccessibilityService() {
     private fun finishTaskLoop(reason: String, allowClaimRescan: Boolean = true) {
         if (!runActive || taskLoopPhase == TaskLoopPhase.FINISHED) return
         if (manualInterruptionDetected) return
+
+        // The run is only over if we are still where the task list lives. Losing the app to the home
+        // screen is recoverable, so try that before writing the run off. A normal completion happens
+        // inside Ctrip, so this cannot cut one short.
+        if (rescueFromLauncherHome(reason)) return
 
         if (!allowClaimRescan || foregroundPackage() != targetPackageName) {
             completeTaskLoop(reason)
@@ -7041,6 +7199,9 @@ class LauncherAccessibilityService : AccessibilityService() {
         private const val MAX_FOREGROUND_WAIT_ATTEMPTS = 20
         private const val MAX_STARTUP_UNREADABLE_POLLS = 12
         private const val MAX_STARTUP_BACK_PRESSES = 8
+        // Reopening the app from the home screen is only worth retrying a couple of times: past that
+        // the launch itself is being blocked, and every attempt costs a foreground-wait timeout.
+        private const val MAX_LAUNCHER_RESCUES = 2
         private const val STARTUP_UNKNOWN_CONFIRMATIONS = 2
         private const val STARTUP_RECOVERY_POLL_MIN_MS = 450
         private const val STARTUP_RECOVERY_POLL_MAX_MS = 750
