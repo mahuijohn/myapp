@@ -2022,7 +2022,12 @@ class LauncherAccessibilityService : AccessibilityService() {
         val labels: Set<String>,
     )
 
-    private val unlikeTitleMetadataRegex = Regex("^\\d[\\d,.，万wW+]*人?点赞.*$")
+    /**
+     * Ctrip labels a liked card with any of 点赞/已收藏/对这篇有兴趣/… , and often with nothing at
+     * all. Such a label may therefore never gate card detection; it only deprioritizes a text node
+     * when a card exposes no real title.
+     */
+    private val unlikeTitleMetadataRegex = Regex("^\\d[\\d,.，万wW+]*\\s*人\\D*$")
     private val unlikeCountRegex = Regex("^([\\d,.，]+(?:\\.\\d+)?)(万|[wW])?$")
 
     /** Waits for the 赞过 masonry to settle, then opens the next unattempted card. */
@@ -2183,7 +2188,7 @@ class LauncherAccessibilityService : AccessibilityService() {
         if (attempt >= UNLIKE_DUMP_SETTLE_ATTEMPTS) {
             dumpWindowForDiagnostics(
                 root,
-                "Unlike & Unfollow failed to resolve a card/title/like-count group on 赞过",
+                "Unlike & Unfollow failed to resolve a cover/title card group on 赞过",
                 force = true,
             )
             finishUnlikeUnfollowApp("no safe visible card group was found")
@@ -2211,9 +2216,9 @@ class LauncherAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Resolves cards from the structure Ctrip actually exposes: a clickable masonry card containing
-     * an Image, a title and a trailing “xxxx人点赞” label. Starting from the count/title pair also
-     * keeps the detector stable when WebView image roles or card heights vary between devices.
+     * Resolves cards from the structure every liked card shares: a cover Image sized like a masonry
+     * tile, followed by the first text line under it. Anchoring on the cover keeps the detector
+     * working for cards whose engagement label reads 已收藏/对这篇有兴趣 or is missing entirely.
      */
     private fun findLikedCardTargets(root: AccessibilityNodeInfo): List<LikedCardTarget> {
         val rootBounds = Rect().also { root.getBoundsInScreen(it) }
@@ -2231,6 +2236,7 @@ class LauncherAccessibilityService : AccessibilityService() {
             ?: return emptyList()
         val texts = collectTextNodes(root)
         val imageBounds = mutableListOf<Rect>()
+        val avatarBounds = mutableListOf<Rect>()
         val cardBounds = mutableListOf<Rect>()
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
@@ -2249,6 +2255,11 @@ class LauncherAccessibilityService : AccessibilityService() {
                     ) {
                         imageBounds.add(bounds)
                     }
+                    if ((className == "Image" || className == "ImageView") &&
+                        widthFraction <= UNLIKE_AVATAR_MAX_WIDTH_FRACTION
+                    ) {
+                        avatarBounds.add(bounds)
+                    }
                     if (node.isClickable &&
                         widthFraction in UNLIKE_COVER_MIN_WIDTH_FRACTION..UNLIKE_CARD_MAX_WIDTH_FRACTION &&
                         heightFraction in UNLIKE_CARD_MIN_HEIGHT_FRACTION..UNLIKE_CARD_MAX_HEIGHT_FRACTION
@@ -2260,52 +2271,51 @@ class LauncherAccessibilityService : AccessibilityService() {
             } catch (_: Exception) {}
         }
 
-        val metadataNodes = texts.filter { unlikeTitleMetadataRegex.matches(it.text.trim()) }
-        return metadataNodes.mapNotNull { metadata ->
+        val covers = if (imageBounds.isNotEmpty()) {
+            imageBounds
+        } else {
+            // Some WebView builds expose no Image role at all; the clickable tile is then the cover.
+            cardBounds
+        }
+        return covers.mapNotNull { cover ->
             val titleNode = texts.asSequence()
-                .filter { it !== metadata }
+                // A place/duration badge is painted inside the cover, so a title must start below it.
+                .filter { it.bounds.top >= cover.bottom - UNLIKE_TITLE_COVER_OVERLAP_TOLERANCE_PX }
+                .filter { it.bounds.top - cover.bottom <= height * UNLIKE_TITLE_MAX_GAP_FRACTION }
                 .filter {
-                    it.bounds.bottom <= metadata.bounds.top + UNLIKE_TITLE_COUNT_OVERLAP_TOLERANCE_PX &&
-                            metadata.bounds.top - it.bounds.bottom <= UNLIKE_TITLE_COUNT_MAX_GAP_PX
+                    horizontalOverlapRatio(it.bounds, cover) >= UNLIKE_TITLE_MIN_HORIZONTAL_OVERLAP
                 }
-                .filter { horizontalOverlapRatio(it.bounds, metadata.bounds) >= UNLIKE_TITLE_MIN_HORIZONTAL_OVERLAP }
                 .map { it to normalizeLikedCardTitle(it.text) }
                 .filter { (_, value) -> value.length >= UNLIKE_TITLE_MIN_LENGTH }
                 .filter { (_, value) -> value !in UNLIKE_LIST_CHROME_TEXTS }
-                .filterNot { (_, value) -> unlikeTitleMetadataRegex.matches(value) }
-                .maxByOrNull { (node, _) -> node.bounds.bottom }
+                // Engagement counts and author names are fallbacks, never preferred over a title.
+                .sortedWith(
+                    compareBy<Pair<TextNode, String>> { (_, value) ->
+                        if (unlikeTitleMetadataRegex.matches(value)) 1 else 0
+                    }
+                        .thenBy { (node, _) -> if (isAvatarLabel(node.bounds, avatarBounds)) 1 else 0 }
+                        .thenBy { (node, _) -> node.bounds.top }
+                )
+                .firstOrNull()
                 ?: return@mapNotNull null
             val title = titleNode.second
-            val titleBounds = titleNode.first.bounds
-            val cover = imageBounds.asSequence()
-                .filter { it.top < titleBounds.top }
-                .filter { titleBounds.top - it.bottom <= height * UNLIKE_TITLE_MAX_GAP_FRACTION }
-                .filter { horizontalOverlapRatio(it, titleBounds) >= UNLIKE_TITLE_MIN_HORIZONTAL_OVERLAP }
-                .maxByOrNull { it.bottom }
-                ?.let(::Rect)
-                ?: cardBounds.asSequence()
-                    .filter { it.contains(titleBounds.centerX(), titleBounds.centerY()) }
-                    .filter { it.contains(metadata.bounds.centerX(), metadata.bounds.centerY()) }
-                    .minByOrNull { it.width().toLong() * it.height() }
-                    ?.let { card ->
-                        Rect(
-                            card.left,
-                            card.top,
-                            card.right,
-                            (titleBounds.top - UNLIKE_COVER_TITLE_PADDING_PX)
-                                .coerceAtLeast(card.top + 1),
-                        )
-                    }
-                ?: return@mapNotNull null
             LikedCardTarget(
                 key = title.lowercase(),
                 title = title,
-                coverBounds = cover,
+                coverBounds = Rect(cover),
             )
         }
             .distinctBy { it.key }
             .sortedWith(compareBy<LikedCardTarget> { it.coverBounds.top }.thenBy { it.coverBounds.left })
     }
+
+    /** True when the text sits on the same row as, and to the right of, a small avatar image. */
+    private fun isAvatarLabel(bounds: Rect, avatarBounds: List<Rect>): Boolean =
+        avatarBounds.any { avatar ->
+            bounds.left >= avatar.left &&
+                    bounds.top < avatar.bottom &&
+                    bounds.bottom > avatar.top
+        }
 
     private fun horizontalOverlapRatio(first: Rect, second: Rect): Float {
         val overlap = minOf(first.right, second.right) - maxOf(first.left, second.left)
@@ -2770,9 +2780,8 @@ class LauncherAccessibilityService : AccessibilityService() {
     private val UNLIKE_CARD_MIN_HEIGHT_FRACTION = 0.20f
     private val UNLIKE_CARD_MAX_HEIGHT_FRACTION = 0.60f
     private val UNLIKE_COVER_TOP_TOLERANCE_PX = 32
-    private val UNLIKE_COVER_TITLE_PADDING_PX = 8
-    private val UNLIKE_TITLE_COUNT_MAX_GAP_PX = 220
-    private val UNLIKE_TITLE_COUNT_OVERLAP_TOLERANCE_PX = 16
+    private val UNLIKE_AVATAR_MAX_WIDTH_FRACTION = 0.12f
+    private val UNLIKE_TITLE_COVER_OVERLAP_TOLERANCE_PX = 16
     private val UNLIKE_TITLE_MAX_GAP_FRACTION = 0.12f
     private val UNLIKE_TITLE_MIN_HORIZONTAL_OVERLAP = 0.60f
     private val UNLIKE_TITLE_MIN_LENGTH = 2
