@@ -1000,10 +1000,11 @@ fun AccessibilityScreen(modifier: Modifier = Modifier) {
             modifier = Modifier.align(Alignment.Start)
         )
         Text(
-            text = "One entry per line, or separated by commas. Matched against each task's title, " +
-                    "description and button. Use it for destinations that ignore the back gesture: " +
-                    "after the award, those tasks return to 携程旅行 by switching apps (home, then the " +
-                    "app's recents card or a relaunch) instead of pressing back.",
+            text = "Optional. A task that ends with another app still on top now returns to 携程旅行 by " +
+                    "switching apps (home, then the app's recents card or a relaunch) on its own. " +
+                    "One entry per line, or separated by commas, matched against each task's title, " +
+                    "description and button: naming a destination here only skips the few back presses " +
+                    "first spent checking whether it responds to back at all.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.align(Alignment.Start).padding(top = 4.dp, bottom = 8.dp)

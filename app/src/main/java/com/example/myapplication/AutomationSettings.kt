@@ -17,10 +17,12 @@ import kotlinx.coroutines.flow.asStateFlow
  *   they override both the skip list and the built-in one. That is what lets a task like
  *   浏览能量大富翁15s run even though its 去完成 button would otherwise be skipped.
  *
- * The third decides how a task *ends*:
+ * The third is an optimisation for how a task *ends*:
  * - **app-switch** entries mean "this destination ignores BACK", matched against a task's title,
- *   description and button. Those tasks return to 携程 by switching apps (HOME, then its Recents card
- *   or a relaunch) instead of spending the BACK ladder that the app silently swallows.
+ *   description and button. A task ending outside 携程 returns by switching apps (HOME, then its
+ *   Recents card or a relaunch) on its own, once a short BACK probe shows the foreign app is still on
+ *   top. An entry here skips that probe for a destination already known to swallow BACK, so nothing
+ *   has to be listed for the return to work — listing it only saves the wasted presses.
  */
 object AutomationSettings {
 
@@ -99,8 +101,9 @@ object AutomationSettings {
     fun matchesWhitelist(vararg fields: String): Boolean = matches(_whitelistTexts.value, fields)
 
     /**
-     * Whether any of [fields] names a destination that ignores BACK, so the task must return to the
-     * target app by switching apps rather than by going back.
+     * Whether any of [fields] names a destination that ignores BACK, so the task can skip the BACK
+     * probe and switch apps straight away. Returning by app switch does not depend on this: it happens
+     * automatically whenever a task ends with a foreign app still on top.
      */
     fun matchesAppSwitchReturn(vararg fields: String): Boolean = matches(_appSwitchTexts.value, fields)
 

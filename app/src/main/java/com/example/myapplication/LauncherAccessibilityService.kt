@@ -378,6 +378,31 @@ class LauncherAccessibilityService : AccessibilityService() {
         currentRoots().firstNotNullOfOrNull { it.packageName?.toString() }
 
     /**
+     * True when 携程 is genuinely the active app: front-most *and* readable.
+     *
+     * Both halves matter. The package alone can be reported while the window is an opaque WebView we
+     * cannot act on, and a readable Ctrip root alone can sit behind a foreign activity that is what the
+     * user actually sees. Every return path asks this question, so it lives in one place.
+     */
+    private fun isTargetAppActive(): Boolean =
+        foregroundPackage() == targetPackageName && targetAppRoot() != null
+
+    /**
+     * The real app on top when it is not 携程 — the signal that decides a switch-apps return by itself,
+     * with no help from the user's list.
+     *
+     * Transient system windows and the launcher are excluded by [isPotentialTaskApp], so a dialog or an
+     * IME briefly covering Ctrip never reads as a foreign app. Deliberately independent of
+     * [confirmedExternalTaskApp]: an unconfirmed destination leaves the run just as stuck, which is the
+     * case the old list existed to cover.
+     */
+    private fun activeForeignAppPackage(): String? {
+        if (isTargetAppActive()) return null
+        val front = readableExternalTaskPackage() ?: foregroundPackage() ?: return null
+        return front.takeIf { isPotentialTaskApp(it) }
+    }
+
+    /**
      * True when the front-most window is the home screen rather than any app.
      *
      * The system UI counts as well: right after HOME the launcher can still be reported under
@@ -6083,7 +6108,7 @@ class LauncherAccessibilityService : AccessibilityService() {
         // Stop recording packages here: everything seen from now on is the launcher or our own app.
         capturingTaskApps = false
 
-        val targetInFront = foregroundPackage() == targetPackageName && targetAppRoot() != null
+        val targetInFront = isTargetAppActive()
         val externalApp = confirmedExternalTaskApp
         // A destination on the user's app-switch list consumes BACK, so both BACK ladders would only
         // burn their retries in it. Go straight to HOME/Recents, which the app cannot intercept.
@@ -6134,7 +6159,7 @@ class LauncherAccessibilityService : AccessibilityService() {
     ) {
         if (manualInterruptionDetected) return
 
-        val targetInFront = foregroundPackage() == targetPackageName && targetAppRoot() != null
+        val targetInFront = isTargetAppActive()
         if (targetInFront) {
             logProgress("BACK recovery revealed $targetPackageName; continuing until $TASK_PAGE_TITLE")
             // returnToTaskPage owns completion; once the list is visible it closes recorded Recents
@@ -6462,14 +6487,7 @@ class LauncherAccessibilityService : AccessibilityService() {
 
     private fun returnToTargetFromRecentsAfterCleanup() {
         val label = targetLabel
-        val targetCard = if (label == null) null else currentRoots()
-            .asSequence()
-            .filter { root ->
-                val rootPackage = root.packageName?.toString()
-                rootPackage == launcherPackage || rootPackage == "com.android.systemui"
-            }
-            .flatMap { collectTextNodes(it).asSequence() }
-            .firstOrNull { it.text.contains(label, ignoreCase = true) }
+        val targetCard = if (label == null) null else findTargetCardInRecents(label)
         val clicked = targetCard?.let { card ->
             val clickable = clickableSelfOrAncestor(card.node, maxDepth = 7)
             if (clickable != null) tryPerformClick(clickable) else tryClickRect(card.bounds)
@@ -6537,22 +6555,45 @@ class LauncherAccessibilityService : AccessibilityService() {
         }
     }
 
+    /**
+     * Finds the target app's card in the Recents overview.
+     *
+     * Restricted to the launcher/system UI windows so that text belonging to a card's *preview* — the
+     * app content rendered inside the thumbnail — can never be mistaken for the card's own title.
+     *
+     * An exact label match wins over a substring one. Recents shows every app whose name merely starts
+     * with 携程旅行 (携程旅行极速版, a 分身 clone, a lookalike), and a substring match took whichever of
+     * those came first in window order, so the automation could resume the wrong app. The substring
+     * fallback is kept for the cloned-app case, where the card carries a badge suffix and no card
+     * matches the plain label exactly.
+     */
+    private fun findTargetCardInRecents(label: String): TextNode? {
+        val cards = currentRoots()
+            .asSequence()
+            .filter { root ->
+                val rootPackage = root.packageName?.toString()
+                rootPackage == launcherPackage || rootPackage == "com.android.systemui"
+            }
+            .flatMap { collectTextNodes(it).asSequence() }
+            .filter { it.text.contains(label, ignoreCase = true) }
+            .toList()
+        return cards.firstOrNull { it.text.trim().equals(label, ignoreCase = true) }
+            ?: cards.firstOrNull()
+    }
+
     /** Taps the 携程 card in the Recents overview, then lets [bringBackTargetApp] re-check. */
     private fun tapTargetCardInRecents(stage: Int) {
         if (manualInterruptionDetected) return
         val label = targetLabel
-        val card = if (label == null) null else currentRoots()
-            .asSequence()
-            .flatMap { collectTextNodes(it).asSequence() }
-            .firstOrNull { it.text.contains(label) }
+        val card = if (label == null) null else findTargetCardInRecents(label)
 
         if (card != null) {
             val clickable = clickableSelfOrAncestor(card.node, maxDepth = 6)
             val clicked =
                 if (clickable != null) tryPerformClick(clickable) else tryClickRect(card.bounds)
             logProgress(
-                if (clicked) "Tapped the '$label' card in Recents"
-                else "Found the '$label' card but could not tap it"
+                if (clicked) "Tapped the '${card.text.trim()}' card in Recents"
+                else "Found the '${card.text.trim()}' card but could not tap it"
             )
         } else {
             logProgress("No '$label' card in Recents")
@@ -6637,16 +6678,29 @@ class LauncherAccessibilityService : AccessibilityService() {
             return
         }
 
-        // Reaching here outside 携程 on an app-switch task means the destination is still on top, and
-        // it is one that eats BACK. Hand off to the app-switch path once rather than spending the
-        // ladder on it. One-shot, so a failed hand-off cannot bounce between the two routes.
-        if (currentTaskReturnsByAppSwitch &&
+        // Outside 携程 with a real foreign app on top, the BACK ladder is only useful while that window
+        // belongs to Ctrip's own Android task; a genuinely separate app either swallows BACK or has
+        // nothing left to pop, and spending all 8 presses there ends in a failed task. So probe with a
+        // few presses and then hand off to the app-switch path, which the app cannot intercept.
+        //
+        // The probe is what keeps the same-task case safe, and it is why this is not simply "not in
+        // 携程 → switch apps": Recents restores a whole task, so switching away from an external
+        // activity that lives in Ctrip's task would keep bringing that same activity back.
+        // The user's list stays supported as a short-circuit: a destination already known to eat BACK
+        // skips the probe entirely. One-shot, so a failed hand-off cannot bounce between the routes.
+        val foreignApp = activeForeignAppPackage()
+        if (foreignApp != null &&
             !appSwitchReturnDelegated &&
-            foregroundPackage() != targetPackageName
+            (currentTaskReturnsByAppSwitch || stage > BACK_PROBE_BEFORE_APP_SWITCH)
         ) {
             appSwitchReturnDelegated = true
             logProgress(
-                "'${currentTaskTitle.orEmpty()}' ignores BACK; switching apps to reach $TASK_PAGE_TITLE"
+                if (currentTaskReturnsByAppSwitch) {
+                    "'${currentTaskTitle.orEmpty()}' ignores BACK; switching apps to reach $TASK_PAGE_TITLE"
+                } else {
+                    "Still in $foreignApp after $BACK_PROBE_BEFORE_APP_SWITCH BACK press(es); " +
+                            "switching apps to reach $TASK_PAGE_TITLE"
+                }
             )
             switchBackToTargetApp()
             return
@@ -7475,6 +7529,16 @@ class LauncherAccessibilityService : AccessibilityService() {
         // BACK presses allowed while stepping back to 签到任务 from a page inside the app. Every press
         // is followed by page verification, so this cannot continue past the task page.
         private const val MAX_IN_APP_BACK_PRESSES = 8
+
+        /**
+         * BACK presses spent probing a foreign app before [returnToTaskPage] switches apps instead.
+         *
+         * Enough to unwind an external activity launched into Ctrip's own task (the case where
+         * switching apps would only restore that activity), short enough that an app which swallows
+         * BACK is not handed the whole ladder. [MAX_IN_APP_BACK_PRESSES] still applies in full while
+         * the pages being popped are Ctrip's own.
+         */
+        private const val BACK_PROBE_BEFORE_APP_SWITCH = 3
         // Recents taps come before a relaunch, because they need no background-launch permission.
         private const val RECENTS_ATTEMPTS = 2
         private const val RECENTS_SETTLE_MS = 1_200L
