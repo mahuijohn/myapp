@@ -1427,21 +1427,68 @@ class LauncherAccessibilityService : AccessibilityService() {
         }
     }
 
-    // Find all package names whose application label contains the provided label
-    private fun findPackagesByLabel(pm: PackageManager, label: String): List<String> {
-        val out = mutableListOf<String>()
+    /**
+     * Launcher packages whose application label contains [label], paired with that label.
+     *
+     * One entry per package: a cloned ("dual") app resolves to the same package name as the original,
+     * and an app can expose several launcher activities, so the first label seen per package wins.
+     */
+    private fun labelledLauncherPackages(pm: PackageManager, label: String): List<Pair<String, String>> {
         val mainIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val resolveList = pm.queryIntentActivities(mainIntent, PackageManager.ResolveInfoFlags.of(0))
-        val t = label.trim()
+        val resolveList = try {
+            pm.queryIntentActivities(mainIntent, PackageManager.ResolveInfoFlags.of(0))
+        } catch (_: Exception) {
+            emptyList()
+        }
+        val wanted = label.trim()
+        val out = LinkedHashMap<String, String>()
         for (ri in resolveList) {
             val activityInfo = ri.activityInfo ?: continue
-            val appInfo = activityInfo.applicationInfo
-            val appLabel = pm.getApplicationLabel(appInfo).toString()
-            if (appLabel.contains(t, ignoreCase = true)) out.add(activityInfo.packageName)
+            val appLabel = try {
+                pm.getApplicationLabel(activityInfo.applicationInfo).toString()
+            } catch (_: Exception) {
+                continue
+            }
+            if (!appLabel.contains(wanted, ignoreCase = true)) continue
+            out.putIfAbsent(activityInfo.packageName, appLabel)
         }
-        // A cloned ("dual") app resolves to the same package name as the original, and an app can
-        // expose several launcher activities, so collapse duplicates to avoid running twice.
-        return out.distinct()
+        return out.map { it.key to it.value }
+    }
+
+    /**
+     * Resolves the app label the user typed into the package(s) to automate, exact name first.
+     *
+     * Exactness has to *win* here, not merely sort first. 携程旅行极速版 and similar lookalikes also
+     * contain 携程旅行, `queryIntentActivities` returns them in no meaningful order, and the run drives
+     * `targetPackages[0]` — so a substring hit could make the whole automation open the wrong app from
+     * the very first launch, after which every Recents tap and relaunch faithfully returns to it. That
+     * is upstream of the return paths and looks identical to a bad Recents pick.
+     *
+     * The substring set stays as the fallback, so a deliberately partial label ("携程") still resolves,
+     * as does a clone whose label carries a badge suffix. Dropped lookalikes are logged rather than
+     * silently discarded, because "matched 1 package" with no explanation is how this went unnoticed.
+     */
+    private fun findPackagesByLabel(pm: PackageManager, label: String): List<String> {
+        val matches = labelledLauncherPackages(pm, label)
+        val wanted = label.trim()
+        val exact = matches.filter { it.second.trim().equals(wanted, ignoreCase = true) }
+        if (exact.isEmpty()) {
+            if (matches.size > 1) {
+                logProgress(
+                    "No app is named exactly '$wanted'; using every partial match: " +
+                            matches.joinToString(", ") { "${it.second} (${it.first})" }
+                )
+            }
+            return matches.map { it.first }
+        }
+        val dropped = matches.filterNot { it in exact }
+        if (dropped.isNotEmpty()) {
+            logProgress(
+                "Using '$wanted' (${exact.joinToString(", ") { it.first }}); ignoring same-prefix " +
+                        "app(s) ${dropped.joinToString(", ") { "${it.second} (${it.first})" }}"
+            )
+        }
+        return exact.map { it.first }
     }
 
     // Launch the package at the given index from targetPackages
@@ -3222,19 +3269,6 @@ class LauncherAccessibilityService : AccessibilityService() {
             } catch (_: Exception) {}
         }
         return out
-    }
-
-    private fun findFirstPackageByLabel(pm: PackageManager, label: String): String? {
-        val mainIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val resolveList = pm.queryIntentActivities(mainIntent, PackageManager.ResolveInfoFlags.of(0))
-        val t = label.trim()
-        for (ri in resolveList) {
-            val activityInfo = ri.activityInfo ?: continue
-            val appInfo = activityInfo.applicationInfo
-            val appLabel = pm.getApplicationLabel(appInfo).toString()
-            if (appLabel.contains(t, ignoreCase = true)) return activityInfo.packageName
-        }
-        return null
     }
 
     private fun searchAndClickElement() {
