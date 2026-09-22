@@ -1412,11 +1412,13 @@ class LauncherAccessibilityService : AccessibilityService() {
 
         mainHandler.post {
             val pm = packageManager
-            // find all packages matching the label and iterate through them
+            // Resolve the label to the app(s) to automate; the name must match exactly.
             val pkgs = findPackagesByLabel(pm, label)
             if (pkgs.isEmpty()) {
-                Log.w(TAG, "No app found matching label: $label")
-                finishTaskWithResult("Failed: no app found matching '$label'")
+                Log.w(TAG, "No app named exactly: $label")
+                // findPackagesByLabel has already logged any same-prefix app it turned down, so the
+                // run log says which lookalike was present rather than just "not found".
+                finishTaskWithResult("Failed: no app is named exactly '$label'")
                 return@post
             }
             targetPackages = pkgs
@@ -1429,6 +1431,9 @@ class LauncherAccessibilityService : AccessibilityService() {
 
     /**
      * Launcher packages whose application label contains [label], paired with that label.
+     *
+     * The substring sweep exists only so [findPackagesByLabel] can *name* the near misses it rejects.
+     * Nothing but an exactly-matching label is ever automated.
      *
      * One entry per package: a cloned ("dual") app resolves to the same package name as the original,
      * and an app can expose several launcher activities, so the first label seen per package wins.
@@ -1456,36 +1461,39 @@ class LauncherAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Resolves the app label the user typed into the package(s) to automate, exact name first.
+     * Resolves the app label the user typed into the package(s) to automate. **Exact label only.**
      *
-     * Exactness has to *win* here, not merely sort first. 携程旅行极速版 and similar lookalikes also
+     * A same-prefix app is never a substitute for the real one. 携程旅行极速版 and similar lookalikes also
      * contain 携程旅行, `queryIntentActivities` returns them in no meaningful order, and the run drives
-     * `targetPackages[0]` — so a substring hit could make the whole automation open the wrong app from
-     * the very first launch, after which every Recents tap and relaunch faithfully returns to it. That
-     * is upstream of the return paths and looks identical to a bad Recents pick.
+     * `targetPackages[0]` — so accepting a substring made the whole automation open the wrong app from
+     * the very first launch, after which every Recents tap and relaunch faithfully returned to it.
      *
-     * The substring set stays as the fallback, so a deliberately partial label ("携程") still resolves,
-     * as does a clone whose label carries a badge suffix. Dropped lookalikes are logged rather than
-     * silently discarded, because "matched 1 package" with no explanation is how this went unnoticed.
+     * Rejecting rather than guessing is the point: an empty result fails the run with a message naming
+     * what *was* found, which the user can act on, whereas silently automating a lookalike cannot be
+     * noticed. Near misses are logged for that reason. A cloned ("dual") app still resolves, because it
+     * reports the original's label and package name.
      */
     private fun findPackagesByLabel(pm: PackageManager, label: String): List<String> {
-        val matches = labelledLauncherPackages(pm, label)
         val wanted = label.trim()
-        val exact = matches.filter { it.second.trim().equals(wanted, ignoreCase = true) }
+        val (exact, samePrefix) = labelledLauncherPackages(pm, wanted)
+            .partition { it.second.trim().equals(wanted, ignoreCase = true) }
+        fun describe(entries: List<Pair<String, String>>) =
+            entries.joinToString(", ") { "${it.second} (${it.first})" }
         if (exact.isEmpty()) {
-            if (matches.size > 1) {
-                logProgress(
-                    "No app is named exactly '$wanted'; using every partial match: " +
-                            matches.joinToString(", ") { "${it.second} (${it.first})" }
-                )
-            }
-            return matches.map { it.first }
+            logProgress(
+                if (samePrefix.isEmpty()) {
+                    "No installed app is named '$wanted'"
+                } else {
+                    "No app is named exactly '$wanted'; refusing to automate the same-prefix " +
+                            "app(s) ${describe(samePrefix)}"
+                }
+            )
+            return emptyList()
         }
-        val dropped = matches.filterNot { it in exact }
-        if (dropped.isNotEmpty()) {
+        if (samePrefix.isNotEmpty()) {
             logProgress(
                 "Using '$wanted' (${exact.joinToString(", ") { it.first }}); ignoring same-prefix " +
-                        "app(s) ${dropped.joinToString(", ") { "${it.second} (${it.first})" }}"
+                        "app(s) ${describe(samePrefix)}"
             )
         }
         return exact.map { it.first }
@@ -1666,7 +1674,16 @@ class LauncherAccessibilityService : AccessibilityService() {
                 // the container's centre sits between the two icons, so the per-label bounds are the
                 // only way to aim at a specific entry.
                 val labelNodes = mutableListOf<Pair<AccessibilityNodeInfo, Rect>>()
-                val matched = collectTextNodes(root).filter { it.text.contains(label, ignoreCase = true) }
+                // Entries named exactly 携程旅行 win. A resolver-style chooser can also list a
+                // same-prefix app such as 携程旅行极速版, and clicking that opens the wrong app. The
+                // looser match is kept only for when nothing matches exactly, because a MIUI dual-app
+                // picker may decorate the clone's label — there both entries are still the same package.
+                val allMatches = collectTextNodes(root).filter { it.text.contains(label, ignoreCase = true) }
+                val exactMatches = allMatches.filter { it.text.trim().equals(label.trim(), ignoreCase = true) }
+                val matched = if (exactMatches.isNotEmpty()) exactMatches else allMatches
+                if (exactMatches.isEmpty() && allMatches.isNotEmpty()) {
+                    logProgress("No chooser entry is named exactly '$label'; aiming at partial matches")
+                }
                 for ((n, ownBounds) in matched.map { it.node to it.bounds }) {
                     if (!ownBounds.isEmpty()) labelNodes.add(n to ownBounds)
                     val entry = clickableSelfOrAncestor(n) ?: n
@@ -6590,30 +6607,25 @@ class LauncherAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Finds the target app's card in the Recents overview.
+     * Finds the target app's card in the Recents overview. **Exact label only.**
      *
      * Restricted to the launcher/system UI windows so that text belonging to a card's *preview* — the
      * app content rendered inside the thumbnail — can never be mistaken for the card's own title.
      *
-     * An exact label match wins over a substring one. Recents shows every app whose name merely starts
-     * with 携程旅行 (携程旅行极速版, a 分身 clone, a lookalike), and a substring match took whichever of
-     * those came first in window order, so the automation could resume the wrong app. The substring
-     * fallback is kept for the cloned-app case, where the card carries a badge suffix and no card
-     * matches the plain label exactly.
+     * No substring fallback, for the same reason as [findPackagesByLabel]: Recents also lists every app
+     * whose name merely starts with 携程旅行, and tapping one of those resumes the wrong app. Finding no
+     * card is the better failure — [bringBackTargetApp] then relaunches by package name, which cannot
+     * pick the wrong app because the package was itself resolved by exact label.
      */
-    private fun findTargetCardInRecents(label: String): TextNode? {
-        val cards = currentRoots()
+    private fun findTargetCardInRecents(label: String): TextNode? =
+        currentRoots()
             .asSequence()
             .filter { root ->
                 val rootPackage = root.packageName?.toString()
                 rootPackage == launcherPackage || rootPackage == "com.android.systemui"
             }
             .flatMap { collectTextNodes(it).asSequence() }
-            .filter { it.text.contains(label, ignoreCase = true) }
-            .toList()
-        return cards.firstOrNull { it.text.trim().equals(label, ignoreCase = true) }
-            ?: cards.firstOrNull()
-    }
+            .firstOrNull { it.text.trim().equals(label.trim(), ignoreCase = true) }
 
     /** Taps the 携程 card in the Recents overview, then lets [bringBackTargetApp] re-check. */
     private fun tapTargetCardInRecents(stage: Int) {
