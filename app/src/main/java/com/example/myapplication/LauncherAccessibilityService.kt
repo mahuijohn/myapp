@@ -2293,8 +2293,8 @@ class LauncherAccessibilityService : AccessibilityService() {
     )
 
     private enum class UnlikeDetailVariant(val label: String) {
-        VIDEO("video favorite"),
-        ARTICLE("article favorite"),
+        VIDEO("video reaction"),
+        ARTICLE("article reaction"),
     }
 
     private data class UnlikeControl(
@@ -5235,7 +5235,27 @@ class LauncherAccessibilityService : AccessibilityService() {
             it.text.trim().startsWith(PLANET_CONTENT_LIKE_PAGE_MARKER_PREFIX)
         }
 
-    /** Waits for a real card detail and resolves the same article/video control as unlike mode. */
+    /**
+     * Resolves the concrete reaction slots exposed by the task destination samples.
+     *
+     * Article details expose `o_cct_tripshoot_detail_reaction` and place Like at the first action
+     * slot of the bottom row (x≈52%). Native video details place Like in the second right-rail slot
+     * (x≈93%, y≈58%), immediately below the profile/follow slot. The shared geometry resolver already
+     * identifies those positions; task context supplies their direction because these DOMs expose
+     * only an icon/image and count, not checked or textual liked state.
+     */
+    private fun findPlanetContentLikeControl(root: AccessibilityNodeInfo): UnlikeControl? {
+        val control = findUnlikeControl(root, LikeControlEligibility.ANY) ?: return null
+        if (control.likeCount == null) return null
+        return when (control.variant) {
+            UnlikeDetailVariant.ARTICLE -> control.takeIf {
+                findNodeByViewId(root, PLANET_CONTENT_LIKE_ARTICLE_REACTION_ID) != null
+            }
+            UnlikeDetailVariant.VIDEO -> control
+        }
+    }
+
+    /** Waits for a real card detail and resolves its sampled article/video Like slot. */
     private fun settlePlanetContentLikeDetail(
         token: Long,
         card: PlanetFeedCardTarget,
@@ -5261,31 +5281,25 @@ class LauncherAccessibilityService : AccessibilityService() {
         } else {
             0
         }
-        val control = root?.takeIf { detailCandidate }?.let {
-            findUnlikeControl(it, LikeControlEligibility.LIKE)
-        }
+        val control = root?.takeIf { detailCandidate }?.let(::findPlanetContentLikeControl)
         if (control != null &&
             (nextStableHits >= PLANET_CONTENT_LIKE_STABLE_SAMPLES ||
                     attempt >= PLANET_CONTENT_LIKE_DETAIL_MIN_POLLS)
         ) {
-            when {
-                control.checkedOrSelected || hasLikedSemantic(control.labels) -> {
-                    planetContentLikeUnsupportedCount++
+            if (control.checkedOrSelected || hasLikedSemantic(control.labels)) {
+                planetContentLikeUnsupportedCount++
+                logProgress(
+                    "'${card.authorName}' card is already liked; no toggle dispatched"
+                )
+                returnFromPlanetContentLikeDetail(token, card, "already liked")
+            } else {
+                if (!hasUnlikedSemantic(control.labels) && !control.selectionStateSupported) {
                     logProgress(
-                        "'${card.authorName}' card is already liked; no toggle dispatched"
-                    )
-                    returnFromPlanetContentLikeDetail(token, card, "already liked")
-                }
-                !hasUnlikedSemantic(control.labels) &&
-                        !(control.selectionStateSupported && !control.checkedOrSelected) -> {
-                    planetContentLikeUnsupportedCount++
-                    returnFromPlanetContentLikeDetail(
-                        token,
-                        card,
-                        "like control did not expose a safe unliked state",
+                        "Using sampled ${control.variant.label} slot for '${card.authorName}' " +
+                                "(count ${control.likeCount?.toLong()}, no exposed selection state)"
                     )
                 }
-                else -> dispatchPlanetContentLike(token, card, control)
+                dispatchPlanetContentLike(token, card, control)
             }
             return
         }
@@ -5356,11 +5370,12 @@ class LauncherAccessibilityService : AccessibilityService() {
             planetContentLikeState != PlanetContentLikeState.VERIFYING_LIKE
         ) return
         val root = targetAppRoot()?.takeIf { foregroundPackage() == targetPackageName }
-        val current = root?.let {
-            findUnlikeControl(it, LikeControlEligibility.ANY)
-        }?.takeIf { it.variant == before.variant }
+        val current = root?.let(::findPlanetContentLikeControl)
+            ?.takeIf { it.variant == before.variant }
         val countIncreased = before.likeCount != null && current?.likeCount != null &&
                 current.likeCount > before.likeCount
+        val countDecreased = before.likeCount != null && current?.likeCount != null &&
+                current.likeCount < before.likeCount
         val selectionSet = !before.checkedOrSelected && current?.checkedOrSelected == true
         val semanticSet = current != null && hasUnlikedSemantic(before.labels) &&
                 hasLikedSemantic(current.labels)
@@ -5378,6 +5393,12 @@ class LauncherAccessibilityService : AccessibilityService() {
             returnFromPlanetContentLikeDetail(token, card, "like confirmed")
             return
         }
+        if (countDecreased) {
+            // A numeric-only control can hide an already-liked visual state. Strong decrease evidence
+            // means the first tap removed a like, so restore it exactly once before leaving.
+            restorePlanetContentLikeAfterDecrease(token, card, before, current)
+            return
+        }
         if (attempt >= PLANET_CONTENT_LIKE_VERIFY_ATTEMPTS) {
             planetContentLikeAmbiguousCount++
             logProgress(
@@ -5389,6 +5410,73 @@ class LauncherAccessibilityService : AccessibilityService() {
         }
         mainHandler.postDelayed(
             { verifyPlanetContentLike(token, card, before, attempt + 1) },
+            PLANET_CONTENT_LIKE_POLL_MS,
+        )
+    }
+
+    private fun restorePlanetContentLikeAfterDecrease(
+        token: Long,
+        card: PlanetFeedCardTarget,
+        before: UnlikeControl,
+        current: UnlikeControl,
+    ) {
+        if (!isPlanetContentLikeCallbackValid(token) ||
+            planetContentLikeState != PlanetContentLikeState.VERIFYING_LIKE
+        ) return
+        planetContentLikeUnsupportedCount++
+        planetContentLikeState = PlanetContentLikeState.LIKING
+        if (!performClick(current.target)) {
+            planetContentLikeAmbiguousCount++
+            logProgress(
+                "Like count decreased for '${card.authorName}', but the one-time restore tap was rejected"
+            )
+            returnFromPlanetContentLikeDetail(token, card, "pre-existing like could not be restored")
+            return
+        }
+        planetContentLikeState = PlanetContentLikeState.VERIFYING_LIKE
+        recordAction(
+            "Restored pre-existing ${current.variant.label} for '${card.authorName}' after count decreased"
+        )
+        mainHandler.postDelayed(
+            { verifyPlanetContentLikeRestore(token, card, before) },
+            PLANET_CONTENT_LIKE_ACTION_SETTLE_MS,
+        )
+    }
+
+    private fun verifyPlanetContentLikeRestore(
+        token: Long,
+        card: PlanetFeedCardTarget,
+        original: UnlikeControl,
+        attempt: Int = 1,
+    ) {
+        if (!isPlanetContentLikeCallbackValid(token) ||
+            planetContentLikeState != PlanetContentLikeState.VERIFYING_LIKE
+        ) return
+        val current = targetAppRoot()
+            ?.takeIf { foregroundPackage() == targetPackageName }
+            ?.let(::findPlanetContentLikeControl)
+            ?.takeIf { it.variant == original.variant }
+        val countRestored = original.likeCount != null && current?.likeCount != null &&
+                current.likeCount >= original.likeCount
+        val stateRestored = current?.checkedOrSelected == true ||
+                (current != null && hasLikedSemantic(current.labels))
+        if (countRestored || stateRestored) {
+            logProgress(
+                "Pre-existing like restored for '${card.authorName}'; author remains excluded from progress"
+            )
+            returnFromPlanetContentLikeDetail(token, card, "pre-existing like restored")
+            return
+        }
+        if (attempt >= PLANET_CONTENT_LIKE_VERIFY_ATTEMPTS) {
+            planetContentLikeAmbiguousCount++
+            logProgress(
+                "Restore was tapped once for '${card.authorName}' but could not be verified"
+            )
+            returnFromPlanetContentLikeDetail(token, card, "restore result unverified")
+            return
+        }
+        mainHandler.postDelayed(
+            { verifyPlanetContentLikeRestore(token, card, original, attempt + 1) },
             PLANET_CONTENT_LIKE_POLL_MS,
         )
     }
@@ -8127,6 +8215,8 @@ class LauncherAccessibilityService : AccessibilityService() {
         private const val PLANET_CONTENT_LIKE_TARGET_COUNT = 30
         private const val PLANET_CONTENT_LIKE_AUTHOR_BADGE = "官方旗舰店"
         private const val PLANET_CONTENT_LIKE_PAGE_MARKER_PREFIX = "携程星球号旅游旗舰店"
+        private const val PLANET_CONTENT_LIKE_ARTICLE_REACTION_ID =
+            "o_cct_tripshoot_detail_reaction"
         private const val PLANET_CONTENT_LIKE_TIMEOUT_MS = 10 * 60_000L
         private const val PLANET_CONTENT_LIKE_INITIAL_SETTLE_MS = 1_800L
         private const val PLANET_CONTENT_LIKE_POLL_MS = 500L
