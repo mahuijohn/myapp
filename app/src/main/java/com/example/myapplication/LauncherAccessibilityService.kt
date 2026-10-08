@@ -231,6 +231,33 @@ class LauncherAccessibilityService : AccessibilityService() {
     private var hotelRankingTapAttempt = 0
     private var hotelRankingVerificationPolls = 0
     private var hotelRankingDiagnosticsDumped = false
+    /** Dedicated in-app flow for 星球号内容点赞. */
+    private enum class PlanetContentLikeState {
+        IDLE,
+        WAITING_FOR_FEED,
+        SETTLING_FEED,
+        VERIFYING_DETAIL,
+        LIKING,
+        VERIFYING_LIKE,
+        RETURNING_TO_FEED,
+        WAITING_FOR_FEED_REFRESH,
+        RETURNING_TO_TASKS,
+    }
+    private var planetContentLikeState = PlanetContentLikeState.IDLE
+    private var planetContentLikeDeadlineMs = 0L
+    /** A card is opened at most once; a dispatched toggle is never retried for the same author. */
+    private val attemptedPlanetLikeCards = mutableSetOf<String>()
+    /** Every selected author is consumed once, regardless of card/control outcome. */
+    private val consumedPlanetLikeAuthors = mutableSetOf<String>()
+    private val toggledPlanetLikeAuthors = mutableSetOf<String>()
+    private val completedPlanetLikeAuthors = mutableSetOf<String>()
+    private var planetContentLikeScrolls = 0
+    private var planetContentLikeNoMoveScrolls = 0
+    private var planetContentLikeLastVisibleSignature: Set<String> = emptySet()
+    private var planetContentLikeAmbiguousCount = 0
+    private var planetContentLikeUnsupportedCount = 0
+    /** Invalidates callbacks from an earlier task/run. */
+    private var planetContentLikeToken = 0L
     /** Dedicated in-app flow for 天天领现金-浏览笔记. */
     private enum class DailyCashNoteState {
         IDLE, WAITING_FOR_DESTINATION, WAITING_FOR_SCROLL, FINDING_CARD,
@@ -858,6 +885,7 @@ class LauncherAccessibilityService : AccessibilityService() {
         hotelRankingTapAttempt = 0
         hotelRankingVerificationPolls = 0
         hotelRankingDiagnosticsDumped = false
+        resetPlanetContentLikeSession()
         dailyCashNoteState = DailyCashNoteState.IDLE
         dailyCashNoteDeadlineMs = 0L
         dailyCashDestinationHits = 0
@@ -1372,6 +1400,7 @@ class LauncherAccessibilityService : AccessibilityService() {
         hotelRankingTapAttempt = 0
         hotelRankingVerificationPolls = 0
         hotelRankingDiagnosticsDumped = false
+        resetPlanetContentLikeSession()
         dailyCashNoteState = DailyCashNoteState.IDLE
         dailyCashNoteDeadlineMs = 0L
         dailyCashDestinationHits = 0
@@ -2272,9 +2301,12 @@ class LauncherAccessibilityService : AccessibilityService() {
         val variant: UnlikeDetailVariant,
         val target: ClickTarget,
         val likeCount: Double?,
+        val selectionStateSupported: Boolean,
         val checkedOrSelected: Boolean,
         val labels: Set<String>,
     )
+
+    private enum class LikeControlEligibility { UNLIKE, LIKE, ANY }
 
     /**
      * Ctrip labels a liked card with any of 点赞/已收藏/对这篇有兴趣/… , and often with nothing at
@@ -2894,7 +2926,10 @@ class LauncherAccessibilityService : AccessibilityService() {
         )
     }
 
-    private fun findUnlikeControl(root: AccessibilityNodeInfo): UnlikeControl? {
+    private fun findUnlikeControl(
+        root: AccessibilityNodeInfo,
+        eligibility: LikeControlEligibility = LikeControlEligibility.UNLIKE,
+    ): UnlikeControl? {
         val bounds = Rect().also { root.getBoundsInScreen(it) }
         if (bounds.isEmpty) return null
         val width = bounds.width().toFloat()
@@ -2914,6 +2949,7 @@ class LauncherAccessibilityService : AccessibilityService() {
                 variant = variant,
                 target = ClickTarget(node, candidate, "${variant.label} geometry"),
                 likeCount = parseUnlikeCount(labels),
+                selectionStateSupported = nodeOrDescendantCheckable(node),
                 checkedOrSelected = nodeOrDescendantChecked(node),
                 labels = labels,
             )
@@ -2934,7 +2970,7 @@ class LauncherAccessibilityService : AccessibilityService() {
                 .map { (node, candidate) ->
                     build(UnlikeDetailVariant.ARTICLE, node, candidate)
                 }
-                .filter { it.likeCount != null || hasLikedSemantic(it.labels) }
+                .filter { isLikeControlEligible(it, eligibility) }
                 .minByOrNull {
                     kotlin.math.abs(it.target.bounds.centerX() - (bounds.left + width * 0.52f))
                 }
@@ -2950,8 +2986,25 @@ class LauncherAccessibilityService : AccessibilityService() {
                         candidate.height() <= height * UNLIKE_DETAIL_CONTROL_MAX_HEIGHT_FRACTION
             }
             .map { (node, candidate) -> build(UnlikeDetailVariant.VIDEO, node, candidate) }
-            .filter { it.likeCount != null || hasLikedSemantic(it.labels) }
+            .filter { isLikeControlEligible(it, eligibility) }
             .minByOrNull { it.target.bounds.top }
+    }
+
+    private fun isLikeControlEligible(
+        control: UnlikeControl,
+        eligibility: LikeControlEligibility,
+    ): Boolean = when (eligibility) {
+        LikeControlEligibility.UNLIKE ->
+            !hasUnlikedSemantic(control.labels) &&
+                    (control.checkedOrSelected || hasLikedSemantic(control.labels) ||
+                            control.likeCount != null)
+        LikeControlEligibility.LIKE ->
+            hasUnlikedSemantic(control.labels) ||
+                    (control.selectionStateSupported && !control.checkedOrSelected &&
+                            !hasLikedSemantic(control.labels))
+        LikeControlEligibility.ANY ->
+            control.likeCount != null || control.selectionStateSupported ||
+                    hasLikedSemantic(control.labels) || hasUnlikedSemantic(control.labels)
     }
 
     private fun parseUnlikeCount(labels: Set<String>): Double? {
@@ -2963,6 +3016,23 @@ class LauncherAccessibilityService : AccessibilityService() {
             return value * multiplier
         }
         return null
+    }
+
+    private fun nodeOrDescendantCheckable(root: AccessibilityNodeInfo): Boolean {
+        val queue = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+        queue.add(root to 0)
+        while (queue.isNotEmpty()) {
+            val (node, depth) = queue.removeFirst()
+            try {
+                if (node.isCheckable) return true
+                if (depth < 3) {
+                    for (i in 0 until node.childCount) {
+                        node.getChild(i)?.let { queue.add(it to depth + 1) }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        return false
     }
 
     private fun nodeOrDescendantChecked(root: AccessibilityNodeInfo): Boolean {
@@ -4642,6 +4712,10 @@ class LauncherAccessibilityService : AccessibilityService() {
                 row.title.trim() == DAILY_CASH_NOTE_TASK_TITLE &&
                 row.description.contains(DAILY_CASH_NOTE_DESCRIPTION)
 
+    private fun isPlanetContentLikeTask(row: TaskRow): Boolean =
+        row.buttonText == PLANET_CONTENT_LIKE_ACTION &&
+                row.title.trim() == PLANET_CONTENT_LIKE_TASK_TITLE
+
     /** Registry lookup is the only place task-list wording is coupled to mini-program behavior. */
     private fun miniProgramSpecFor(title: String): MiniProgramTaskSpec? {
         val normalized = title.trim()
@@ -4656,6 +4730,8 @@ class LauncherAccessibilityService : AccessibilityService() {
         val planetFollowTask = isPlanetFollowTask(row)
         val hotelRankingTask = isHotelRankingTask(row)
         val dailyCashNoteTask = isDailyCashNoteTask(row)
+        val planetContentLikeTask = isPlanetContentLikeTask(row)
+        if (planetContentLikeTask) resetPlanetContentLikeSession()
         processedTasks.add(row.title)
         currentTaskTitle = row.title
         currentTaskReturnsByAppSwitch = AutomationSettings.matchesAppSwitchReturn(
@@ -4711,6 +4787,11 @@ class LauncherAccessibilityService : AccessibilityService() {
         }
         dailyCashDiagnosticsDumped = false
         dailyCashTaskToken++
+        if (planetContentLikeTask) {
+            planetContentLikeState = PlanetContentLikeState.WAITING_FOR_FEED
+            planetContentLikeDeadlineMs =
+                SystemClock.uptimeMillis() + PLANET_CONTENT_LIKE_TIMEOUT_MS
+        }
         tasksStarted++
 
         when {
@@ -4730,6 +4811,13 @@ class LauncherAccessibilityService : AccessibilityService() {
             hotelRankingTask -> {
                 logProgressSection(
                     "Task $tasksStarted: ${row.title} → ${row.buttonText} (hotel ranking interaction)"
+                )
+                if (row.description.isNotEmpty()) logProgress("Task note: ${row.description}")
+            }
+            planetContentLikeTask -> {
+                logProgressSection(
+                    "Task $tasksStarted: ${row.title} → ${row.buttonText} " +
+                            "(like $PLANET_CONTENT_LIKE_TARGET_COUNT unique authors)"
                 )
                 if (row.description.isNotEmpty()) logProgress("Task note: ${row.description}")
             }
@@ -4778,7 +4866,9 @@ class LauncherAccessibilityService : AccessibilityService() {
         // Suppress interruption handling while the task destination is in flight. Dedicated in-app
         // tasks deliberately do not capture or later kill another package.
         expectingExternalApp = true
-        capturingTaskApps = !(planetFollowTask || hotelRankingTask || dailyCashNoteTask)
+        capturingTaskApps = !(
+                planetFollowTask || hotelRankingTask || dailyCashNoteTask || planetContentLikeTask
+                )
         taskAppCleanupToken++
         taskAppCleanupInProgress = false
         taskApps.clear()
@@ -4820,6 +4910,18 @@ class LauncherAccessibilityService : AccessibilityService() {
                     HOTEL_RANKING_DATA_SETTLE_MS
                 )
             }
+            planetContentLikeTask -> {
+                val taskToken = planetContentLikeToken
+                logProgress(
+                    "Waiting for the two-column 星球号 feed; target " +
+                            "$PLANET_CONTENT_LIKE_TARGET_COUNT unique authors"
+                )
+                noteProgress(PLANET_CONTENT_LIKE_TIMEOUT_MS)
+                mainHandler.postDelayed(
+                    { settlePlanetContentLikeFeed(taskToken) },
+                    PLANET_CONTENT_LIKE_INITIAL_SETTLE_MS,
+                )
+            }
             dailyCashNoteTask -> {
                 val taskToken = dailyCashTaskToken
                 logProgress("Waiting for $DAILY_CASH_DESTINATION_MARKER before scrolling to note cards")
@@ -4834,6 +4936,575 @@ class LauncherAccessibilityService : AccessibilityService() {
                 mainHandler.postDelayed({ confirmLeaveApp(dwell) }, randomDelay(700, 1200))
             }
         }
+    }
+
+    private data class PlanetFeedCardTarget(
+        val key: String,
+        val authorKey: String,
+        val authorName: String,
+        val title: String,
+        val coverBounds: Rect,
+    )
+
+    private fun resetPlanetContentLikeSession() {
+        planetContentLikeToken++
+        planetContentLikeState = PlanetContentLikeState.IDLE
+        planetContentLikeDeadlineMs = 0L
+        attemptedPlanetLikeCards.clear()
+        consumedPlanetLikeAuthors.clear()
+        toggledPlanetLikeAuthors.clear()
+        completedPlanetLikeAuthors.clear()
+        planetContentLikeScrolls = 0
+        planetContentLikeNoMoveScrolls = 0
+        planetContentLikeLastVisibleSignature = emptySet()
+        planetContentLikeAmbiguousCount = 0
+        planetContentLikeUnsupportedCount = 0
+    }
+
+    private fun isPlanetContentLikeCallbackValid(token: Long): Boolean =
+        token == planetContentLikeToken && runActive && !manualInterruptionDetected &&
+                activeAutomationMode == AutomationMode.COLLECT_AWARDS &&
+                currentTaskTitle?.trim() == PLANET_CONTENT_LIKE_TASK_TITLE
+
+    /**
+     * Waits for stable visible author/card groups, then opens one card whose author has not had a
+     * like toggle dispatched in this task. Author names, not card titles, define uniqueness.
+     */
+    private fun settlePlanetContentLikeFeed(
+        token: Long,
+        attempt: Int = 1,
+        previousSignature: Set<String> = emptySet(),
+        stableHits: Int = 0,
+    ) {
+        if (!isPlanetContentLikeCallbackValid(token) ||
+            planetContentLikeState !in setOf(
+                PlanetContentLikeState.WAITING_FOR_FEED,
+                PlanetContentLikeState.SETTLING_FEED,
+            )
+        ) return
+        if (SystemClock.uptimeMillis() >= planetContentLikeDeadlineMs) {
+            failPlanetContentLikeTask(
+                "timed out after ${PLANET_CONTENT_LIKE_TIMEOUT_MS / 1000}s with " +
+                        "${completedPlanetLikeAuthors.size}/$PLANET_CONTENT_LIKE_TARGET_COUNT " +
+                        "confirmed unique authors"
+            )
+            return
+        }
+
+        planetContentLikeState = PlanetContentLikeState.SETTLING_FEED
+        val root = targetAppRoot()?.takeIf { foregroundPackage() == targetPackageName }
+        if (root == null) {
+            if (attempt >= PLANET_CONTENT_LIKE_FEED_SETTLE_ATTEMPTS) {
+                failPlanetContentLikeTask("the 星球号 feed was not readable")
+            } else {
+                mainHandler.postDelayed(
+                    { settlePlanetContentLikeFeed(token, attempt + 1, previousSignature, stableHits) },
+                    PLANET_CONTENT_LIKE_POLL_MS,
+                )
+            }
+            return
+        }
+
+        val targets = findPlanetFeedCardTargets(root)
+        val signature = targets.map {
+            "${it.key}@${it.coverBounds.left},${it.coverBounds.top}," +
+                    "${it.coverBounds.right},${it.coverBounds.bottom}"
+        }.toSet()
+        val nextStableHits = when {
+            signature.isEmpty() -> 0
+            signature == previousSignature -> stableHits + 1
+            else -> 1
+        }
+        val feedMarkerVisible = hasPlanetContentFeedMarker(root)
+        if (feedMarkerVisible && nextStableHits >= PLANET_CONTENT_LIKE_STABLE_SAMPLES) {
+            if (completedPlanetLikeAuthors.size >= PLANET_CONTENT_LIKE_TARGET_COUNT) {
+                finishPlanetContentLikeTask(token)
+                return
+            }
+            val selected = targets.firstOrNull {
+                it.key !in attemptedPlanetLikeCards &&
+                        it.authorKey !in consumedPlanetLikeAuthors
+            }
+            if (selected != null) {
+                if (attemptedPlanetLikeCards.size >= PLANET_CONTENT_LIKE_MAX_CARDS) {
+                    failPlanetContentLikeTask(
+                        "reached the $PLANET_CONTENT_LIKE_MAX_CARDS-card safety limit with " +
+                                "${completedPlanetLikeAuthors.size}/$PLANET_CONTENT_LIKE_TARGET_COUNT likes"
+                    )
+                    return
+                }
+                attemptedPlanetLikeCards.add(selected.key)
+                consumedPlanetLikeAuthors.add(selected.authorKey)
+                planetContentLikeLastVisibleSignature = emptySet()
+                planetContentLikeNoMoveScrolls = 0
+                planetContentLikeState = PlanetContentLikeState.VERIFYING_DETAIL
+                val sourcePageSignature = pageSignature(root)
+                logProgress(
+                    "Opening '${selected.authorName}' for unique-author like " +
+                            "${completedPlanetLikeAuthors.size + 1}/$PLANET_CONTENT_LIKE_TARGET_COUNT"
+                )
+                if (!tryClickRect(selected.coverBounds)) {
+                    planetContentLikeUnsupportedCount++
+                    planetContentLikeState = PlanetContentLikeState.SETTLING_FEED
+                    logProgress("Card cover tap was rejected for '${selected.authorName}'; skipping this card")
+                    mainHandler.postDelayed(
+                        { settlePlanetContentLikeFeed(token) },
+                        PLANET_CONTENT_LIKE_POLL_MS,
+                    )
+                    return
+                }
+                recordAction(
+                    "Opened 星球号 card '${selected.title}' by '${selected.authorName}'"
+                )
+                mainHandler.postDelayed(
+                    { settlePlanetContentLikeDetail(token, selected, sourcePageSignature) },
+                    PLANET_CONTENT_LIKE_DETAIL_INITIAL_SETTLE_MS,
+                )
+                return
+            }
+
+            val visibleSignature = targets.map { it.key }.toSet()
+            if (visibleSignature == planetContentLikeLastVisibleSignature) {
+                planetContentLikeNoMoveScrolls++
+            } else {
+                planetContentLikeLastVisibleSignature = visibleSignature
+                planetContentLikeNoMoveScrolls = 0
+            }
+            if (planetContentLikeNoMoveScrolls >= PLANET_CONTENT_LIKE_NO_MOVE_CONFIRMATIONS) {
+                failPlanetContentLikeTask(
+                    "only ${completedPlanetLikeAuthors.size}/$PLANET_CONTENT_LIKE_TARGET_COUNT " +
+                            "unique author likes were confirmed before the feed ended"
+                )
+                return
+            }
+            if (planetContentLikeScrolls >= PLANET_CONTENT_LIKE_MAX_SCROLLS) {
+                failPlanetContentLikeTask(
+                    "reached the $PLANET_CONTENT_LIKE_MAX_SCROLLS-scroll safety limit with " +
+                            "${completedPlanetLikeAuthors.size}/$PLANET_CONTENT_LIKE_TARGET_COUNT likes"
+                )
+                return
+            }
+            planetContentLikeScrolls++
+            if (!swipeVertical(
+                    PLANET_CONTENT_LIKE_SCROLL_FROM_FRACTION,
+                    PLANET_CONTENT_LIKE_SCROLL_TO_FRACTION,
+                    PLANET_CONTENT_LIKE_SCROLL_DURATION_MS,
+                )
+            ) {
+                failPlanetContentLikeTask("the 星球号 feed scroll gesture was rejected")
+                return
+            }
+            logProgress(
+                "No new visible author; scrolling for more " +
+                        "($planetContentLikeScrolls/$PLANET_CONTENT_LIKE_MAX_SCROLLS)"
+            )
+            mainHandler.postDelayed(
+                { settlePlanetContentLikeFeed(token) },
+                PLANET_CONTENT_LIKE_SCROLL_SETTLE_MS,
+            )
+            return
+        }
+
+        if (attempt >= PLANET_CONTENT_LIKE_FEED_SETTLE_ATTEMPTS) {
+            dumpWindowForDiagnostics(
+                root,
+                "Could not resolve stable author/title/cover groups on 星球号 feed",
+                force = true,
+            )
+            failPlanetContentLikeTask("no safe visible 星球号 card/author group was found")
+            return
+        }
+        mainHandler.postDelayed(
+            {
+                settlePlanetContentLikeFeed(
+                    token,
+                    attempt + 1,
+                    signature,
+                    nextStableHits,
+                )
+            },
+            PLANET_CONTENT_LIKE_POLL_MS,
+        )
+    }
+
+    /**
+     * The feed exposes flat WebView siblings: cover, title, clickable author, then 官方旗舰店.
+     * Geometry associates those nodes without ever clicking the author label (which opens a profile).
+     */
+    private fun findPlanetFeedCardTargets(root: AccessibilityNodeInfo): List<PlanetFeedCardTarget> {
+        val width = resources.displayMetrics.widthPixels
+        val height = resources.displayMetrics.heightPixels
+        val texts = collectTextNodes(root)
+        val clickables = collectClickableInWindow(root)
+        val badges = texts.filter { it.text.trim() == PLANET_CONTENT_LIKE_AUTHOR_BADGE }
+        return badges.mapNotNull { badge ->
+            val badgeOnLeft = badge.bounds.centerX() < width / 2
+            val author = texts.asSequence()
+                .filter { it !== badge }
+                .filter { (it.bounds.centerX() < width / 2) == badgeOnLeft }
+                .filter {
+                    runCatching { it.node.isClickable }.getOrDefault(false) &&
+                            it.bounds.width() <= width * PLANET_CONTENT_LIKE_AUTHOR_MAX_WIDTH_FRACTION
+                }
+                .map { it to normalizePlanetAuthorName(it.text) }
+                .filter { (_, value) ->
+                    value.length in PLANET_CONTENT_LIKE_AUTHOR_MIN_LENGTH..
+                            PLANET_CONTENT_LIKE_AUTHOR_MAX_LENGTH &&
+                            value !in PLANET_CONTENT_LIKE_CHROME_TEXTS
+                }
+                .filter { (node, _) ->
+                    node.bounds.top <= badge.bounds.bottom + PLANET_CONTENT_LIKE_AUTHOR_Y_TOLERANCE_PX &&
+                            kotlin.math.abs(node.bounds.centerY() - badge.bounds.centerY()) <=
+                            PLANET_CONTENT_LIKE_AUTHOR_Y_TOLERANCE_PX &&
+                            kotlin.math.abs(node.bounds.centerX() - badge.bounds.centerX()) <=
+                            width * PLANET_CONTENT_LIKE_AUTHOR_X_TOLERANCE_FRACTION
+                }
+                .minByOrNull { (node, _) ->
+                    kotlin.math.abs(node.bounds.centerY() - badge.bounds.centerY()) * 3 +
+                            kotlin.math.abs(node.bounds.centerX() - badge.bounds.centerX())
+                } ?: return@mapNotNull null
+
+            val authorName = author.second
+            val authorKey = authorName.lowercase()
+            val titleNode = texts.asSequence()
+                .filter { it !== badge && it !== author.first }
+                .filter { (it.bounds.centerX() < width / 2) == badgeOnLeft }
+                .filter {
+                    it.bounds.top < author.first.bounds.top &&
+                            author.first.bounds.top - it.bounds.bottom in
+                            -PLANET_CONTENT_LIKE_TITLE_OVERLAP_TOLERANCE_PX..
+                            PLANET_CONTENT_LIKE_TITLE_MAX_GAP_PX
+                }
+                .filter {
+                    horizontalOverlapRatio(it.bounds, author.first.bounds) >=
+                            PLANET_CONTENT_LIKE_TITLE_MIN_OVERLAP
+                }
+                .map { it to normalizeLikedCardTitle(it.text) }
+                .filter { (_, value) ->
+                    value.length >= PLANET_CONTENT_LIKE_TITLE_MIN_LENGTH &&
+                            value !in PLANET_CONTENT_LIKE_CHROME_TEXTS &&
+                            !value.startsWith(PLANET_CONTENT_LIKE_PAGE_MARKER_PREFIX)
+                }
+                .maxByOrNull { (node, _) -> node.bounds.bottom }
+                ?: return@mapNotNull null
+
+            val cover = clickables.asSequence()
+                .map { it.second }
+                .filter { bounds ->
+                    val widthFraction = bounds.width().toFloat() / width
+                    val heightFraction = bounds.height().toFloat() / height
+                    widthFraction in PLANET_CONTENT_LIKE_COVER_MIN_WIDTH_FRACTION..
+                            PLANET_CONTENT_LIKE_COVER_MAX_WIDTH_FRACTION &&
+                            heightFraction in PLANET_CONTENT_LIKE_COVER_MIN_HEIGHT_FRACTION..
+                            PLANET_CONTENT_LIKE_COVER_MAX_HEIGHT_FRACTION
+                }
+                .filter { (it.centerX() < width / 2) == badgeOnLeft }
+                .filter {
+                    it.top < titleNode.first.bounds.top &&
+                            titleNode.first.bounds.top - it.bottom in
+                            -PLANET_CONTENT_LIKE_COVER_OVERLAP_TOLERANCE_PX..
+                            PLANET_CONTENT_LIKE_COVER_TITLE_MAX_GAP_PX
+                }
+                .filter {
+                    horizontalOverlapRatio(it, titleNode.first.bounds) >=
+                            PLANET_CONTENT_LIKE_COVER_MIN_OVERLAP
+                }
+                .maxByOrNull { it.bottom }
+                ?.let(::Rect)
+                ?: return@mapNotNull null
+
+            val title = titleNode.second
+            PlanetFeedCardTarget(
+                key = "$authorKey|${title.lowercase()}",
+                authorKey = authorKey,
+                authorName = authorName,
+                title = title,
+                coverBounds = cover,
+            )
+        }
+            .distinctBy { it.key }
+            .sortedWith(compareBy<PlanetFeedCardTarget> { it.coverBounds.top }
+                .thenBy { it.coverBounds.left })
+    }
+
+    private fun normalizePlanetAuthorName(raw: String): String =
+        raw.trim().replace(Regex("\\s+"), " ").take(PLANET_CONTENT_LIKE_AUTHOR_MAX_LENGTH)
+
+    private fun hasPlanetContentFeedMarker(root: AccessibilityNodeInfo): Boolean =
+        collectTextNodes(root).any {
+            it.text.trim().startsWith(PLANET_CONTENT_LIKE_PAGE_MARKER_PREFIX)
+        }
+
+    /** Waits for a real card detail and resolves the same article/video control as unlike mode. */
+    private fun settlePlanetContentLikeDetail(
+        token: Long,
+        card: PlanetFeedCardTarget,
+        sourcePageSignature: Set<String>,
+        attempt: Int = 1,
+        previousSignature: Set<String> = emptySet(),
+        stableHits: Int = 0,
+    ) {
+        if (!isPlanetContentLikeCallbackValid(token) ||
+            planetContentLikeState != PlanetContentLikeState.VERIFYING_DETAIL
+        ) return
+        if (SystemClock.uptimeMillis() >= planetContentLikeDeadlineMs) {
+            failPlanetContentLikeTask("timed out while opening '${card.authorName}'")
+            return
+        }
+        val root = targetAppRoot()?.takeIf { foregroundPackage() == targetPackageName }
+        val signature = root?.let(::pageSignature).orEmpty()
+        val detailCandidate = root != null && signature.isNotEmpty() &&
+                signature != sourcePageSignature && !hasPlanetContentFeedMarker(root) &&
+                hasUnlikeDetailBackControl(root)
+        val nextStableHits = if (detailCandidate) {
+            if (signature == previousSignature) stableHits + 1 else 1
+        } else {
+            0
+        }
+        val control = root?.takeIf { detailCandidate }?.let {
+            findUnlikeControl(it, LikeControlEligibility.LIKE)
+        }
+        if (control != null &&
+            (nextStableHits >= PLANET_CONTENT_LIKE_STABLE_SAMPLES ||
+                    attempt >= PLANET_CONTENT_LIKE_DETAIL_MIN_POLLS)
+        ) {
+            when {
+                control.checkedOrSelected || hasLikedSemantic(control.labels) -> {
+                    planetContentLikeUnsupportedCount++
+                    logProgress(
+                        "'${card.authorName}' card is already liked; no toggle dispatched"
+                    )
+                    returnFromPlanetContentLikeDetail(token, card, "already liked")
+                }
+                !hasUnlikedSemantic(control.labels) &&
+                        !(control.selectionStateSupported && !control.checkedOrSelected) -> {
+                    planetContentLikeUnsupportedCount++
+                    returnFromPlanetContentLikeDetail(
+                        token,
+                        card,
+                        "like control did not expose a safe unliked state",
+                    )
+                }
+                else -> dispatchPlanetContentLike(token, card, control)
+            }
+            return
+        }
+
+        if (attempt >= PLANET_CONTENT_LIKE_DETAIL_SETTLE_ATTEMPTS) {
+            planetContentLikeUnsupportedCount++
+            root?.let {
+                dumpWindowForDiagnostics(
+                    it,
+                    "Like control not found for '${card.authorName}' / '${card.title}'",
+                    force = true,
+                    maxNodes = MANUAL_DUMP_MAX_NODES,
+                )
+            }
+            returnFromPlanetContentLikeDetail(token, card, "no safe article/video like control")
+            return
+        }
+        mainHandler.postDelayed(
+            {
+                settlePlanetContentLikeDetail(
+                    token,
+                    card,
+                    sourcePageSignature,
+                    attempt + 1,
+                    if (detailCandidate) signature else emptySet(),
+                    nextStableHits,
+                )
+            },
+            PLANET_CONTENT_LIKE_POLL_MS,
+        )
+    }
+
+    private fun dispatchPlanetContentLike(
+        token: Long,
+        card: PlanetFeedCardTarget,
+        control: UnlikeControl,
+    ) {
+        if (!isPlanetContentLikeCallbackValid(token) ||
+            planetContentLikeState != PlanetContentLikeState.VERIFYING_DETAIL
+        ) return
+        // State changes first so content-change events cannot dispatch this toggle twice.
+        planetContentLikeState = PlanetContentLikeState.LIKING
+        if (!performClick(control.target)) {
+            planetContentLikeUnsupportedCount++
+            planetContentLikeState = PlanetContentLikeState.VERIFYING_DETAIL
+            returnFromPlanetContentLikeDetail(token, card, "like tap was rejected")
+            return
+        }
+        toggledPlanetLikeAuthors.add(card.authorKey)
+        planetContentLikeState = PlanetContentLikeState.VERIFYING_LIKE
+        recordAction(
+            "Clicked ${control.variant.label} like for '${card.authorName}' at " +
+                    control.target.bounds.toShortString()
+        )
+        mainHandler.postDelayed(
+            { verifyPlanetContentLike(token, card, control) },
+            PLANET_CONTENT_LIKE_ACTION_SETTLE_MS,
+        )
+    }
+
+    private fun verifyPlanetContentLike(
+        token: Long,
+        card: PlanetFeedCardTarget,
+        before: UnlikeControl,
+        attempt: Int = 1,
+    ) {
+        if (!isPlanetContentLikeCallbackValid(token) ||
+            planetContentLikeState != PlanetContentLikeState.VERIFYING_LIKE
+        ) return
+        val root = targetAppRoot()?.takeIf { foregroundPackage() == targetPackageName }
+        val current = root?.let {
+            findUnlikeControl(it, LikeControlEligibility.ANY)
+        }?.takeIf { it.variant == before.variant }
+        val countIncreased = before.likeCount != null && current?.likeCount != null &&
+                current.likeCount > before.likeCount
+        val selectionSet = !before.checkedOrSelected && current?.checkedOrSelected == true
+        val semanticSet = current != null && hasUnlikedSemantic(before.labels) &&
+                hasLikedSemantic(current.labels)
+        if (countIncreased || selectionSet || semanticSet) {
+            completedPlanetLikeAuthors.add(card.authorKey)
+            val evidence = when {
+                countIncreased -> "like count increased"
+                selectionSet -> "selected state set"
+                else -> "label changed to liked"
+            }
+            logProgress(
+                "Like confirmed for '${card.authorName}' ($evidence): " +
+                        "${completedPlanetLikeAuthors.size}/$PLANET_CONTENT_LIKE_TARGET_COUNT unique authors"
+            )
+            returnFromPlanetContentLikeDetail(token, card, "like confirmed")
+            return
+        }
+        if (attempt >= PLANET_CONTENT_LIKE_VERIFY_ATTEMPTS) {
+            planetContentLikeAmbiguousCount++
+            logProgress(
+                "Like was tapped once for '${card.authorName}' but not verified; " +
+                        "this author will not be tapped again"
+            )
+            returnFromPlanetContentLikeDetail(token, card, "like result unverified")
+            return
+        }
+        mainHandler.postDelayed(
+            { verifyPlanetContentLike(token, card, before, attempt + 1) },
+            PLANET_CONTENT_LIKE_POLL_MS,
+        )
+    }
+
+    private fun returnFromPlanetContentLikeDetail(
+        token: Long,
+        card: PlanetFeedCardTarget,
+        outcome: String,
+    ) {
+        if (!isPlanetContentLikeCallbackValid(token)) return
+        planetContentLikeState = PlanetContentLikeState.RETURNING_TO_FEED
+        logProgress("Returning from '${card.authorName}' ($outcome)")
+        val accepted = runCatching { performGlobalAction(GLOBAL_ACTION_BACK) }.getOrDefault(false)
+        if (!accepted) logProgress("Android global BACK was not acknowledged; verifying the feed anyway")
+        planetContentLikeState = PlanetContentLikeState.WAITING_FOR_FEED_REFRESH
+        mainHandler.postDelayed(
+            { waitForPlanetContentLikeFeedAfterReturn(token, card) },
+            PLANET_CONTENT_LIKE_RETURN_SETTLE_MS,
+        )
+    }
+
+    private fun waitForPlanetContentLikeFeedAfterReturn(
+        token: Long,
+        card: PlanetFeedCardTarget,
+        attempt: Int = 1,
+        previousSignature: Set<String> = emptySet(),
+        stableHits: Int = 0,
+    ) {
+        if (!isPlanetContentLikeCallbackValid(token) ||
+            planetContentLikeState != PlanetContentLikeState.WAITING_FOR_FEED_REFRESH
+        ) return
+        val root = targetAppRoot()?.takeIf { foregroundPackage() == targetPackageName }
+        val targets = root?.let(::findPlanetFeedCardTargets).orEmpty()
+        val signature = targets.map { it.key }.toSet()
+        val feedVisible = root != null && hasPlanetContentFeedMarker(root) && targets.isNotEmpty()
+        val nextStableHits = if (feedVisible) {
+            if (signature == previousSignature) stableHits + 1 else 1
+        } else {
+            0
+        }
+        if (nextStableHits >= PLANET_CONTENT_LIKE_STABLE_SAMPLES) {
+            if (completedPlanetLikeAuthors.size >= PLANET_CONTENT_LIKE_TARGET_COUNT) {
+                finishPlanetContentLikeTask(token)
+            } else {
+                planetContentLikeLastVisibleSignature = emptySet()
+                planetContentLikeNoMoveScrolls = 0
+                planetContentLikeState = PlanetContentLikeState.SETTLING_FEED
+                mainHandler.postDelayed(
+                    { settlePlanetContentLikeFeed(token) },
+                    PLANET_CONTENT_LIKE_POLL_MS,
+                )
+            }
+            return
+        }
+        if (attempt >= PLANET_CONTENT_LIKE_RETURN_ATTEMPTS ||
+            SystemClock.uptimeMillis() >= planetContentLikeDeadlineMs
+        ) {
+            root?.let {
+                dumpWindowForDiagnostics(
+                    it,
+                    "星球号 feed did not return after '${card.authorName}'",
+                    force = true,
+                )
+            }
+            failPlanetContentLikeTask(
+                "the 星球号 feed did not become stable after '${card.authorName}'"
+            )
+            return
+        }
+        mainHandler.postDelayed(
+            {
+                waitForPlanetContentLikeFeedAfterReturn(
+                    token,
+                    card,
+                    attempt + 1,
+                    signature,
+                    nextStableHits,
+                )
+            },
+            PLANET_CONTENT_LIKE_POLL_MS,
+        )
+    }
+
+    private fun finishPlanetContentLikeTask(token: Long) {
+        if (!isPlanetContentLikeCallbackValid(token) ||
+            completedPlanetLikeAuthors.size < PLANET_CONTENT_LIKE_TARGET_COUNT
+        ) return
+        planetContentLikeState = PlanetContentLikeState.RETURNING_TO_TASKS
+        planetContentLikeDeadlineMs = 0L
+        logProgress(
+            "星球号 content-like target reached: ${completedPlanetLikeAuthors.size} unique authors; " +
+                    "$planetContentLikeAmbiguousCount unverified, " +
+                    "$planetContentLikeUnsupportedCount skipped"
+        )
+        mainHandler.postDelayed(
+            {
+                if (isPlanetContentLikeCallbackValid(token) &&
+                    planetContentLikeState == PlanetContentLikeState.RETURNING_TO_TASKS
+                ) returnToTaskPage()
+            },
+            PLANET_CONTENT_LIKE_RETURN_TO_TASKS_SETTLE_MS,
+        )
+    }
+
+    private fun failPlanetContentLikeTask(reason: String) {
+        if (planetContentLikeState == PlanetContentLikeState.IDLE ||
+            planetContentLikeState == PlanetContentLikeState.RETURNING_TO_TASKS
+        ) return
+        logProgress(
+            "星球号 content-like task failed: $reason; " +
+                    "confirmed=${completedPlanetLikeAuthors.size}, " +
+                    "toggled=${toggledPlanetLikeAuthors.size}, " +
+                    "cards=${attemptedPlanetLikeCards.size}"
+        )
+        capturingTaskApps = false
+        failCurrentTaskWithScreenshot(reason) { returnToTaskPage() }
     }
 
     /** Waits for and clicks the exact top-right 关注 control on a 星球号 destination page. */
@@ -6087,7 +6758,9 @@ class LauncherAccessibilityService : AccessibilityService() {
     private fun isIgnoredRow(row: TaskRow): Boolean {
         // This schema has a dedicated in-app interaction flow, so it must not be excluded by a broad
         // user skip entry such as 去完成 or 关注.
-        if (isPlanetFollowTask(row) || isHotelRankingTask(row) || isDailyCashNoteTask(row)) return false
+        if (isPlanetFollowTask(row) || isHotelRankingTask(row) || isDailyCashNoteTask(row) ||
+            isPlanetContentLikeTask(row)
+        ) return false
         // Registry-supported mini-program tasks own their CTA interaction, so they bypass the broad
         // 去微信 exclusion without weakening that safety rule for unknown WeChat destinations.
         if (miniProgramSpecFor(row) != null) return false
@@ -7447,6 +8120,51 @@ class LauncherAccessibilityService : AccessibilityService() {
             0.50f to 0.79f,
             0.30f to 0.79f,
             0.70f to 0.79f,
+        )
+        // Dedicated same-app flow: like cards from 30 distinct visible author names.
+        private const val PLANET_CONTENT_LIKE_TASK_TITLE = "星球号内容点赞"
+        private const val PLANET_CONTENT_LIKE_ACTION = "去完成"
+        private const val PLANET_CONTENT_LIKE_TARGET_COUNT = 30
+        private const val PLANET_CONTENT_LIKE_AUTHOR_BADGE = "官方旗舰店"
+        private const val PLANET_CONTENT_LIKE_PAGE_MARKER_PREFIX = "携程星球号旅游旗舰店"
+        private const val PLANET_CONTENT_LIKE_TIMEOUT_MS = 10 * 60_000L
+        private const val PLANET_CONTENT_LIKE_INITIAL_SETTLE_MS = 1_800L
+        private const val PLANET_CONTENT_LIKE_POLL_MS = 500L
+        private const val PLANET_CONTENT_LIKE_STABLE_SAMPLES = 2
+        private const val PLANET_CONTENT_LIKE_FEED_SETTLE_ATTEMPTS = 16
+        private const val PLANET_CONTENT_LIKE_DETAIL_INITIAL_SETTLE_MS = 900L
+        private const val PLANET_CONTENT_LIKE_DETAIL_SETTLE_ATTEMPTS = 16
+        private const val PLANET_CONTENT_LIKE_DETAIL_MIN_POLLS = 4
+        private const val PLANET_CONTENT_LIKE_VERIFY_ATTEMPTS = 10
+        private const val PLANET_CONTENT_LIKE_RETURN_ATTEMPTS = 24
+        private const val PLANET_CONTENT_LIKE_RETURN_SETTLE_MS = 900L
+        private const val PLANET_CONTENT_LIKE_RETURN_TO_TASKS_SETTLE_MS = 700L
+        private const val PLANET_CONTENT_LIKE_ACTION_SETTLE_MS = 700L
+        private const val PLANET_CONTENT_LIKE_MAX_CARDS = 120
+        private const val PLANET_CONTENT_LIKE_MAX_SCROLLS = 60
+        private const val PLANET_CONTENT_LIKE_NO_MOVE_CONFIRMATIONS = 2
+        private const val PLANET_CONTENT_LIKE_SCROLL_FROM_FRACTION = 0.82f
+        private const val PLANET_CONTENT_LIKE_SCROLL_TO_FRACTION = 0.28f
+        private const val PLANET_CONTENT_LIKE_SCROLL_DURATION_MS = 650L
+        private const val PLANET_CONTENT_LIKE_SCROLL_SETTLE_MS = 900L
+        private const val PLANET_CONTENT_LIKE_AUTHOR_MIN_LENGTH = 2
+        private const val PLANET_CONTENT_LIKE_AUTHOR_MAX_LENGTH = 40
+        private const val PLANET_CONTENT_LIKE_AUTHOR_MAX_WIDTH_FRACTION = 0.42f
+        private const val PLANET_CONTENT_LIKE_AUTHOR_X_TOLERANCE_FRACTION = 0.30f
+        private const val PLANET_CONTENT_LIKE_AUTHOR_Y_TOLERANCE_PX = 100
+        private const val PLANET_CONTENT_LIKE_TITLE_MIN_LENGTH = 2
+        private const val PLANET_CONTENT_LIKE_TITLE_MAX_GAP_PX = 220
+        private const val PLANET_CONTENT_LIKE_TITLE_OVERLAP_TOLERANCE_PX = 24
+        private const val PLANET_CONTENT_LIKE_TITLE_MIN_OVERLAP = 0.45f
+        private const val PLANET_CONTENT_LIKE_COVER_MIN_WIDTH_FRACTION = 0.35f
+        private const val PLANET_CONTENT_LIKE_COVER_MAX_WIDTH_FRACTION = 0.55f
+        private const val PLANET_CONTENT_LIKE_COVER_MIN_HEIGHT_FRACTION = 0.15f
+        private const val PLANET_CONTENT_LIKE_COVER_MAX_HEIGHT_FRACTION = 0.58f
+        private const val PLANET_CONTENT_LIKE_COVER_TITLE_MAX_GAP_PX = 180
+        private const val PLANET_CONTENT_LIKE_COVER_OVERLAP_TOLERANCE_PX = 24
+        private const val PLANET_CONTENT_LIKE_COVER_MIN_OVERLAP = 0.55f
+        private val PLANET_CONTENT_LIKE_CHROME_TEXTS = setOf(
+            "返回", PLANET_CONTENT_LIKE_AUTHOR_BADGE, "点赞", "赞", "评论", "收藏", "分享"
         )
         // Dedicated same-app flow shown in the supplied screenshots: enter 天天领现金, scroll once,
         // skip the first visible card row, open a card from the next proven two-column row, then dwell.
