@@ -4714,7 +4714,7 @@ class LauncherAccessibilityService : AccessibilityService() {
 
     private fun isPlanetContentLikeTask(row: TaskRow): Boolean =
         row.buttonText == PLANET_CONTENT_LIKE_ACTION &&
-                row.title.trim() == PLANET_CONTENT_LIKE_TASK_TITLE
+                row.title.trim().startsWith(PLANET_CONTENT_LIKE_TASK_TITLE)
 
     /** Registry lookup is the only place task-list wording is coupled to mini-program behavior. */
     private fun miniProgramSpecFor(title: String): MiniProgramTaskSpec? {
@@ -4964,7 +4964,7 @@ class LauncherAccessibilityService : AccessibilityService() {
     private fun isPlanetContentLikeCallbackValid(token: Long): Boolean =
         token == planetContentLikeToken && runActive && !manualInterruptionDetected &&
                 activeAutomationMode == AutomationMode.COLLECT_AWARDS &&
-                currentTaskTitle?.trim() == PLANET_CONTENT_LIKE_TASK_TITLE
+                currentTaskTitle?.trim()?.startsWith(PLANET_CONTENT_LIKE_TASK_TITLE) == true
 
     /**
      * Waits for stable visible author/card groups, then opens one card whose author has not had a
