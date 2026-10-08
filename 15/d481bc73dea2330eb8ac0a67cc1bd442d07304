@@ -1,0 +1,29 @@
+app/src/main/java/com/example/myapplication/LauncherAccessibilityService.kt
+  s_4fd75580318508::t_c83d8873daef01 234-260
+  s_4fd75580318508::t_49fbad834266e3 888,1403
+  s_4fd75580318508::t_e326e37740b22c 4715-4718
+  s_4fd75580318508::t_df1181e30fb452 4733-4734
+  s_4fd75580318508::t_60713359102593 4790-4794
+  s_4fd75580318508::t_45cb8b24a14ad3 4817-4823
+  s_4fd75580318508::t_17a333ddcf73b2 4869-4871
+  s_4fd75580318508::t_5a220f17e7d493 4913-4924
+  s_4fd75580318508::t_bc3e9b4c59784a 4941-5025,5027-5263,5267-5278,5281-5358,5362-5509
+  s_4fd75580318508::t_ca6312009e71ed 6761-6763
+  s_4fd75580318508::t_1e02344b7686f0 8124-8168
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.44-trip",
+  "base_commit_sha": "15d481bc73dea2330eb8ac0a67cc1bd442d07304",
+  "prompts": {},
+  "sessions": {
+    "s_4fd75580318508": {
+      "agent_id": {
+        "tool": "kiro-desktop",
+        "id": "sess_90167ebc-57cc-477c-b80a-a0cc18a32cf2",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "johnmahui <hui_ma@trip.com>"
+    }
+  }
+}
