@@ -43,6 +43,9 @@ import android.widget.Toast
 import android.Manifest
 import androidx.core.content.ContextCompat
 import androidx.core.app.NotificationCompat
+import java.text.Normalizer
+import java.time.LocalDate
+import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
@@ -251,6 +254,18 @@ class LauncherAccessibilityService : AccessibilityService() {
     private val consumedPlanetLikeAuthors = mutableSetOf<String>()
     private val toggledPlanetLikeAuthors = mutableSetOf<String>()
     private val completedPlanetLikeAuthors = mutableSetOf<String>()
+    /** Progress reported by the task title when this attempt started. */
+    private var planetContentLikeReportedCompleted = 0
+    private var planetContentLikeTotalRequired = PLANET_CONTENT_LIKE_TARGET_COUNT
+    private var planetContentLikeRequiredNewLikes = PLANET_CONTENT_LIKE_TARGET_COUNT
+    private var planetContentLikeCycleEpochDay = 0L
+    private var planetContentLikePersistedAuthorCount = 0
+    private val planetContentLikeProgressPrefs by lazy {
+        applicationContext.getSharedPreferences(
+            PLANET_CONTENT_LIKE_PROGRESS_PREFS,
+            Context.MODE_PRIVATE,
+        )
+    }
     private var planetContentLikeScrolls = 0
     private var planetContentLikeNoMoveScrolls = 0
     private var planetContentLikeLastVisibleSignature: Set<String> = emptySet()
@@ -4712,9 +4727,37 @@ class LauncherAccessibilityService : AccessibilityService() {
                 row.title.trim() == DAILY_CASH_NOTE_TASK_TITLE &&
                 row.description.contains(DAILY_CASH_NOTE_DESCRIPTION)
 
+    private data class PlanetContentLikeProgress(
+        val reportedCompleted: Int,
+        val totalRequired: Int,
+    ) {
+        val remaining: Int get() = (totalRequired - reportedCompleted).coerceAtLeast(0)
+    }
+
+    private fun parsePlanetContentLikeProgress(title: String): PlanetContentLikeProgress? {
+        val normalized = title.trim()
+        if (!normalized.startsWith(PLANET_CONTENT_LIKE_TASK_TITLE)) return null
+        val suffix = normalized.removePrefix(PLANET_CONTENT_LIKE_TASK_TITLE).trim()
+        val match = PLANET_CONTENT_LIKE_PROGRESS_RE.find(normalized)
+        if (match == null) {
+            // Campaign text after the prefix is allowed, but text that looks like a broken counter
+            // must not silently start a fresh 30-like attempt.
+            if (PLANET_CONTENT_LIKE_COUNTER_HINT_RE.containsMatchIn(suffix)) return null
+            return PlanetContentLikeProgress(0, PLANET_CONTENT_LIKE_TARGET_COUNT)
+        }
+        val trailingSuffix = normalized.substring(match.range.last + 1).trim()
+        if (PLANET_CONTENT_LIKE_COUNTER_HINT_RE.containsMatchIn(trailingSuffix)) return null
+        val completed = listOf(match.groupValues[1], match.groupValues[2])
+            .firstOrNull { it.isNotEmpty() }
+            ?.toIntOrNull()
+            ?.takeIf { it in 0..PLANET_CONTENT_LIKE_TARGET_COUNT }
+            ?: return null
+        return PlanetContentLikeProgress(completed, PLANET_CONTENT_LIKE_TARGET_COUNT)
+    }
+
     private fun isPlanetContentLikeTask(row: TaskRow): Boolean =
         row.buttonText == PLANET_CONTENT_LIKE_ACTION &&
-                row.title.trim().startsWith(PLANET_CONTENT_LIKE_TASK_TITLE)
+                parsePlanetContentLikeProgress(row.title) != null
 
     /** Registry lookup is the only place task-list wording is coupled to mini-program behavior. */
     private fun miniProgramSpecFor(title: String): MiniProgramTaskSpec? {
@@ -4731,7 +4774,7 @@ class LauncherAccessibilityService : AccessibilityService() {
         val hotelRankingTask = isHotelRankingTask(row)
         val dailyCashNoteTask = isDailyCashNoteTask(row)
         val planetContentLikeTask = isPlanetContentLikeTask(row)
-        if (planetContentLikeTask) resetPlanetContentLikeSession()
+        if (planetContentLikeTask) preparePlanetContentLikeSession(row.title)
         processedTasks.add(row.title)
         currentTaskTitle = row.title
         currentTaskReturnsByAppSwitch = AutomationSettings.matchesAppSwitchReturn(
@@ -4817,7 +4860,10 @@ class LauncherAccessibilityService : AccessibilityService() {
             planetContentLikeTask -> {
                 logProgressSection(
                     "Task $tasksStarted: ${row.title} → ${row.buttonText} " +
-                            "(like $PLANET_CONTENT_LIKE_TARGET_COUNT unique authors)"
+                            "(title progress $planetContentLikeReportedCompleted/" +
+                            "$planetContentLikeTotalRequired; need " +
+                            "$planetContentLikeRequiredNewLikes new unique authors; " +
+                            "$planetContentLikePersistedAuthorCount persisted author(s) excluded)"
                 )
                 if (row.description.isNotEmpty()) logProgress("Task note: ${row.description}")
             }
@@ -4854,6 +4900,17 @@ class LauncherAccessibilityService : AccessibilityService() {
                         )
                 }
             }
+        }
+
+        if (planetContentLikeTask && planetContentLikeTargetReached()) {
+            recordAction(
+                "No 星球号 likes needed; task title already reports " +
+                        "$planetContentLikeReportedCompleted/$planetContentLikeTotalRequired"
+            )
+            logProgress("星球号 content-like task already complete; staying on $TASK_PAGE_TITLE")
+            markCurrentTaskDone(TASK_OUTCOME_DONE)
+            mainHandler.postDelayed({ processNextTask() }, randomDelay(700, 1_100))
+            return
         }
 
         if (currentTaskReturnsByAppSwitch) {
@@ -4913,8 +4970,8 @@ class LauncherAccessibilityService : AccessibilityService() {
             planetContentLikeTask -> {
                 val taskToken = planetContentLikeToken
                 logProgress(
-                    "Waiting for the two-column 星球号 feed; target " +
-                            "$PLANET_CONTENT_LIKE_TARGET_COUNT unique authors"
+                    "Waiting for the two-column 星球号 feed; " +
+                            "${planetContentLikeProgressLabel()}"
                 )
                 noteProgress(PLANET_CONTENT_LIKE_TIMEOUT_MS)
                 mainHandler.postDelayed(
@@ -4954,12 +5011,87 @@ class LauncherAccessibilityService : AccessibilityService() {
         consumedPlanetLikeAuthors.clear()
         toggledPlanetLikeAuthors.clear()
         completedPlanetLikeAuthors.clear()
+        planetContentLikeReportedCompleted = 0
+        planetContentLikeTotalRequired = PLANET_CONTENT_LIKE_TARGET_COUNT
+        planetContentLikeRequiredNewLikes = PLANET_CONTENT_LIKE_TARGET_COUNT
+        planetContentLikeCycleEpochDay = 0L
+        planetContentLikePersistedAuthorCount = 0
         planetContentLikeScrolls = 0
         planetContentLikeNoMoveScrolls = 0
         planetContentLikeLastVisibleSignature = emptySet()
         planetContentLikeAmbiguousCount = 0
         planetContentLikeUnsupportedCount = 0
     }
+
+    private fun preparePlanetContentLikeSession(title: String) {
+        resetPlanetContentLikeSession()
+        val progress = parsePlanetContentLikeProgress(title)
+            ?: PlanetContentLikeProgress(0, PLANET_CONTENT_LIKE_TARGET_COUNT)
+        planetContentLikeReportedCompleted = progress.reportedCompleted
+        planetContentLikeTotalRequired = progress.totalRequired
+        planetContentLikeRequiredNewLikes = progress.remaining
+        planetContentLikeCycleEpochDay = currentPlanetContentLikeEpochDay()
+        val persisted = loadPersistedPlanetLikeAuthors(planetContentLikeCycleEpochDay)
+        consumedPlanetLikeAuthors.addAll(persisted)
+        planetContentLikePersistedAuthorCount = persisted.size
+    }
+
+    private fun planetContentLikeProgressKey(epochDay: Long): String =
+        "$PLANET_CONTENT_LIKE_PROGRESS_KEY_PREFIX$epochDay"
+
+    private fun loadPersistedPlanetLikeAuthors(epochDay: Long): Set<String> {
+        val activeKey = planetContentLikeProgressKey(epochDay)
+        val persisted = planetContentLikeProgressPrefs
+            .getStringSet(activeKey, emptySet())
+            .orEmpty()
+            .toSet()
+        // This task is daily. Date-qualified keys make failover durable without carrying yesterday's
+        // author exclusions into a fresh 0/30 cycle.
+        val staleKeys = planetContentLikeProgressPrefs.all.keys.filter {
+            it.startsWith(PLANET_CONTENT_LIKE_PROGRESS_KEY_PREFIX) && it != activeKey
+        }
+        if (staleKeys.isNotEmpty()) {
+            planetContentLikeProgressPrefs.edit().apply {
+                staleKeys.forEach(::remove)
+            }.apply()
+        }
+        return persisted
+    }
+
+    private fun currentPlanetContentLikeEpochDay(): Long = LocalDate.now().toEpochDay()
+
+    private fun planetContentLikeCycleChanged(): Boolean =
+        planetContentLikeCycleEpochDay > 0L &&
+                currentPlanetContentLikeEpochDay() != planetContentLikeCycleEpochDay
+
+    private fun persistCompletedPlanetLikeAuthor(authorKey: String): Boolean {
+        val currentEpochDay = currentPlanetContentLikeEpochDay()
+        if (planetContentLikeCycleEpochDay <= 0L) return false
+        val cycleChanged = currentEpochDay != planetContentLikeCycleEpochDay
+        // If midnight landed between dispatch and verification, store the author in the new cycle so
+        // the restarted task cannot click it twice, then stop the stale title-derived attempt.
+        val key = planetContentLikeProgressKey(currentEpochDay)
+        val updated = planetContentLikeProgressPrefs
+            .getStringSet(key, emptySet())
+            .orEmpty()
+            .toMutableSet()
+        if (updated.add(authorKey)) {
+            planetContentLikeProgressPrefs.edit().putStringSet(key, updated.toSet()).apply()
+            planetContentLikePersistedAuthorCount = updated.size
+        }
+        return cycleChanged
+    }
+
+    private fun planetContentLikeTargetReached(): Boolean =
+        completedPlanetLikeAuthors.size >= planetContentLikeRequiredNewLikes
+
+    private fun planetContentLikeEstimatedDailyCompleted(): Int =
+        (planetContentLikeReportedCompleted + completedPlanetLikeAuthors.size)
+            .coerceAtMost(planetContentLikeTotalRequired)
+
+    private fun planetContentLikeProgressLabel(): String =
+        "${completedPlanetLikeAuthors.size}/$planetContentLikeRequiredNewLikes new, " +
+                "${planetContentLikeEstimatedDailyCompleted()}/$planetContentLikeTotalRequired daily"
 
     private fun isPlanetContentLikeCallbackValid(token: Long): Boolean =
         token == planetContentLikeToken && runActive && !manualInterruptionDetected &&
@@ -4982,11 +5114,16 @@ class LauncherAccessibilityService : AccessibilityService() {
                 PlanetContentLikeState.SETTLING_FEED,
             )
         ) return
+        if (planetContentLikeCycleChanged()) {
+            failPlanetContentLikeTask(
+                "the daily cycle changed while processing; restart from the refreshed x/30 title"
+            )
+            return
+        }
         if (SystemClock.uptimeMillis() >= planetContentLikeDeadlineMs) {
             failPlanetContentLikeTask(
                 "timed out after ${PLANET_CONTENT_LIKE_TIMEOUT_MS / 1000}s with " +
-                        "${completedPlanetLikeAuthors.size}/$PLANET_CONTENT_LIKE_TARGET_COUNT " +
-                        "confirmed unique authors"
+                        planetContentLikeProgressLabel()
             )
             return
         }
@@ -5017,7 +5154,7 @@ class LauncherAccessibilityService : AccessibilityService() {
         }
         val feedMarkerVisible = hasPlanetContentFeedMarker(root)
         if (feedMarkerVisible && nextStableHits >= PLANET_CONTENT_LIKE_STABLE_SAMPLES) {
-            if (completedPlanetLikeAuthors.size >= PLANET_CONTENT_LIKE_TARGET_COUNT) {
+            if (planetContentLikeTargetReached()) {
                 finishPlanetContentLikeTask(token)
                 return
             }
@@ -5029,7 +5166,7 @@ class LauncherAccessibilityService : AccessibilityService() {
                 if (attemptedPlanetLikeCards.size >= PLANET_CONTENT_LIKE_MAX_CARDS) {
                     failPlanetContentLikeTask(
                         "reached the $PLANET_CONTENT_LIKE_MAX_CARDS-card safety limit with " +
-                                "${completedPlanetLikeAuthors.size}/$PLANET_CONTENT_LIKE_TARGET_COUNT likes"
+                                planetContentLikeProgressLabel()
                     )
                     return
                 }
@@ -5040,8 +5177,8 @@ class LauncherAccessibilityService : AccessibilityService() {
                 planetContentLikeState = PlanetContentLikeState.VERIFYING_DETAIL
                 val sourcePageSignature = pageSignature(root)
                 logProgress(
-                    "Opening '${selected.authorName}' for unique-author like " +
-                            "${completedPlanetLikeAuthors.size + 1}/$PLANET_CONTENT_LIKE_TARGET_COUNT"
+                    "Opening '${selected.authorName}' for unique-author like; " +
+                            "confirmed ${planetContentLikeProgressLabel()}"
                 )
                 if (!tryClickRect(selected.coverBounds)) {
                     planetContentLikeUnsupportedCount++
@@ -5072,15 +5209,14 @@ class LauncherAccessibilityService : AccessibilityService() {
             }
             if (planetContentLikeNoMoveScrolls >= PLANET_CONTENT_LIKE_NO_MOVE_CONFIRMATIONS) {
                 failPlanetContentLikeTask(
-                    "only ${completedPlanetLikeAuthors.size}/$PLANET_CONTENT_LIKE_TARGET_COUNT " +
-                            "unique author likes were confirmed before the feed ended"
+                    "only ${planetContentLikeProgressLabel()} were confirmed before the feed ended"
                 )
                 return
             }
             if (planetContentLikeScrolls >= PLANET_CONTENT_LIKE_MAX_SCROLLS) {
                 failPlanetContentLikeTask(
                     "reached the $PLANET_CONTENT_LIKE_MAX_SCROLLS-scroll safety limit with " +
-                            "${completedPlanetLikeAuthors.size}/$PLANET_CONTENT_LIKE_TARGET_COUNT likes"
+                            planetContentLikeProgressLabel()
                 )
                 return
             }
@@ -5164,8 +5300,8 @@ class LauncherAccessibilityService : AccessibilityService() {
                             kotlin.math.abs(node.bounds.centerX() - badge.bounds.centerX())
                 } ?: return@mapNotNull null
 
-            val authorName = author.second
-            val authorKey = authorName.lowercase()
+            val authorName = normalizePlanetAuthorName(author.second)
+            val authorKey = canonicalPlanetAuthorKey(authorName)
             val titleNode = texts.asSequence()
                 .filter { it !== badge && it !== author.first }
                 .filter { (it.bounds.centerX() < width / 2) == badgeOnLeft }
@@ -5215,7 +5351,7 @@ class LauncherAccessibilityService : AccessibilityService() {
 
             val title = titleNode.second
             PlanetFeedCardTarget(
-                key = "$authorKey|${title.lowercase()}",
+                key = "$authorKey|${title.lowercase(Locale.ROOT)}",
                 authorKey = authorKey,
                 authorName = authorName,
                 title = title,
@@ -5228,7 +5364,13 @@ class LauncherAccessibilityService : AccessibilityService() {
     }
 
     private fun normalizePlanetAuthorName(raw: String): String =
-        raw.trim().replace(Regex("\\s+"), " ").take(PLANET_CONTENT_LIKE_AUTHOR_MAX_LENGTH)
+        Normalizer.normalize(raw, Normalizer.Form.NFKC)
+            .trim()
+            .replace(Regex("\\s+"), " ")
+            .take(PLANET_CONTENT_LIKE_AUTHOR_MAX_LENGTH)
+
+    private fun canonicalPlanetAuthorKey(raw: String): String =
+        normalizePlanetAuthorName(raw).lowercase(Locale.ROOT)
 
     private fun hasPlanetContentFeedMarker(root: AccessibilityNodeInfo): Boolean =
         collectTextNodes(root).any {
@@ -5261,6 +5403,12 @@ class LauncherAccessibilityService : AccessibilityService() {
         if (!isPlanetContentLikeCallbackValid(token) ||
             planetContentLikeState != PlanetContentLikeState.VERIFYING_DETAIL
         ) return
+        if (planetContentLikeCycleChanged()) {
+            failPlanetContentLikeTask(
+                "the daily cycle changed before the next Like; restart from the refreshed x/30 title"
+            )
+            return
+        }
         if (SystemClock.uptimeMillis() >= planetContentLikeDeadlineMs) {
             failPlanetContentLikeTask("timed out while opening '${card.authorName}'")
             return
@@ -5334,6 +5482,12 @@ class LauncherAccessibilityService : AccessibilityService() {
         if (!isPlanetContentLikeCallbackValid(token) ||
             planetContentLikeState != PlanetContentLikeState.VERIFYING_DETAIL
         ) return
+        if (planetContentLikeCycleChanged()) {
+            failPlanetContentLikeTask(
+                "the daily cycle changed before Like dispatch; restart from the refreshed x/30 title"
+            )
+            return
+        }
         // State changes first so content-change events cannot dispatch this toggle twice.
         planetContentLikeState = PlanetContentLikeState.LIKING
         if (!performClick(control.target)) {
@@ -5374,7 +5528,18 @@ class LauncherAccessibilityService : AccessibilityService() {
         val semanticSet = current != null && hasUnlikedSemantic(before.labels) &&
                 hasLikedSemantic(current.labels)
         if (countIncreased || selectionSet || semanticSet) {
-            completedPlanetLikeAuthors.add(card.authorKey)
+            val cycleChanged = if (completedPlanetLikeAuthors.add(card.authorKey)) {
+                persistCompletedPlanetLikeAuthor(card.authorKey)
+            } else {
+                false
+            }
+            if (cycleChanged) {
+                failPlanetContentLikeTask(
+                    "the daily cycle changed during Like verification; " +
+                            "author was saved for the new cycle"
+                )
+                return
+            }
             val evidence = when {
                 countIncreased -> "like count increased"
                 selectionSet -> "selected state set"
@@ -5382,7 +5547,7 @@ class LauncherAccessibilityService : AccessibilityService() {
             }
             logProgress(
                 "Like confirmed for '${card.authorName}' ($evidence): " +
-                        "${completedPlanetLikeAuthors.size}/$PLANET_CONTENT_LIKE_TARGET_COUNT unique authors"
+                        planetContentLikeProgressLabel()
             )
             returnFromPlanetContentLikeDetail(token, card, "like confirmed")
             return
@@ -5502,6 +5667,13 @@ class LauncherAccessibilityService : AccessibilityService() {
         if (!isPlanetContentLikeCallbackValid(token) ||
             planetContentLikeState != PlanetContentLikeState.WAITING_FOR_FEED_REFRESH
         ) return
+        if (planetContentLikeCycleChanged()) {
+            failPlanetContentLikeTask(
+                "the daily cycle changed while returning to the feed; " +
+                        "restart from the refreshed x/30 title"
+            )
+            return
+        }
         val root = targetAppRoot()?.takeIf { foregroundPackage() == targetPackageName }
         val targets = root?.let(::findPlanetFeedCardTargets).orEmpty()
         val signature = targets.map { it.key }.toSet()
@@ -5512,7 +5684,7 @@ class LauncherAccessibilityService : AccessibilityService() {
             0
         }
         if (nextStableHits >= PLANET_CONTENT_LIKE_STABLE_SAMPLES) {
-            if (completedPlanetLikeAuthors.size >= PLANET_CONTENT_LIKE_TARGET_COUNT) {
+            if (planetContentLikeTargetReached()) {
                 finishPlanetContentLikeTask(token)
             } else {
                 planetContentLikeLastVisibleSignature = emptySet()
@@ -5555,13 +5727,18 @@ class LauncherAccessibilityService : AccessibilityService() {
     }
 
     private fun finishPlanetContentLikeTask(token: Long) {
-        if (!isPlanetContentLikeCallbackValid(token) ||
-            completedPlanetLikeAuthors.size < PLANET_CONTENT_LIKE_TARGET_COUNT
-        ) return
+        if (!isPlanetContentLikeCallbackValid(token) || !planetContentLikeTargetReached()) return
+        if (planetContentLikeCycleChanged()) {
+            failPlanetContentLikeTask(
+                "the daily cycle changed before completion; restart from the refreshed x/30 title"
+            )
+            return
+        }
         planetContentLikeState = PlanetContentLikeState.RETURNING_TO_TASKS
         planetContentLikeDeadlineMs = 0L
         logProgress(
-            "星球号 content-like target reached: ${completedPlanetLikeAuthors.size} unique authors; " +
+            "星球号 content-like target reached: ${planetContentLikeProgressLabel()}; " +
+                    "$planetContentLikePersistedAuthorCount persisted author(s), " +
                     "$planetContentLikeAmbiguousCount unverified, " +
                     "$planetContentLikeUnsupportedCount skipped"
         )
@@ -5581,7 +5758,8 @@ class LauncherAccessibilityService : AccessibilityService() {
         ) return
         logProgress(
             "星球号 content-like task failed: $reason; " +
-                    "confirmed=${completedPlanetLikeAuthors.size}, " +
+                    "progress=${planetContentLikeProgressLabel()}, " +
+                    "persisted=$planetContentLikePersistedAuthorCount, " +
                     "toggled=${toggledPlanetLikeAuthors.size}, " +
                     "cards=${attemptedPlanetLikeCards.size}"
         )
@@ -8207,6 +8385,17 @@ class LauncherAccessibilityService : AccessibilityService() {
         private const val PLANET_CONTENT_LIKE_TASK_TITLE = "星球号内容点赞"
         private const val PLANET_CONTENT_LIKE_ACTION = "去完成"
         private const val PLANET_CONTENT_LIKE_TARGET_COUNT = 30
+        private val PLANET_CONTENT_LIKE_PROGRESS_RE = Regex(
+            "^星球号内容点赞\\s*(?:" +
+                    "\\(\\s*(\\d+)\\s*[/／]\\s*30\\s*\\)|" +
+                    "（\\s*(\\d+)\\s*[/／]\\s*30\\s*）)"
+        )
+        private val PLANET_CONTENT_LIKE_COUNTER_HINT_RE = Regex(
+            "(?:\\d+|[xX])\\s*[/／]\\s*\\d+"
+        )
+        private const val PLANET_CONTENT_LIKE_PROGRESS_PREFS =
+            "planet_content_like_progress"
+        private const val PLANET_CONTENT_LIKE_PROGRESS_KEY_PREFIX = "authors_"
         private const val PLANET_CONTENT_LIKE_AUTHOR_BADGE = "官方旗舰店"
         private const val PLANET_CONTENT_LIKE_PAGE_MARKER_PREFIX = "携程星球号旅游旗舰店"
         private const val PLANET_CONTENT_LIKE_TIMEOUT_MS = 10 * 60_000L
