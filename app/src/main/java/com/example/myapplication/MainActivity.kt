@@ -72,8 +72,11 @@ import com.example.myapplication.ui.theme.MyApplicationTheme
 import com.example.myapplication.utils.DeviceUtils
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+private const val PLANET_AUTHOR_REFRESH_INTERVAL_MS = 60_000L
 
 class MainActivity : ComponentActivity() {
     private var pendingCompletionToast: String? = null
@@ -82,6 +85,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         handleNavigationIntent(intent)
         AutomationSettings.init(this)
+        PlanetLikeProgressStore.init(this)
         enableEdgeToEdge()
         setContent {
             MyApplicationTheme {
@@ -101,6 +105,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onPostResume() {
         super.onPostResume()
+        PlanetLikeProgressStore.refreshToday()
         showPendingCompletionToast()
     }
 
@@ -858,6 +863,14 @@ fun AccessibilityScreen(modifier: Modifier = Modifier) {
     val whitelistTexts by AutomationSettings.whitelistTexts.collectAsState()
     val appSwitchTextsRaw by AutomationSettings.appSwitchTextsRaw.collectAsState()
     val appSwitchTexts by AutomationSettings.appSwitchTexts.collectAsState()
+    val likedPlanetAuthors by PlanetLikeProgressStore.todayAuthorNames.collectAsState()
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            PlanetLikeProgressStore.refreshToday()
+            delay(PLANET_AUTHOR_REFRESH_INTERVAL_MS)
+        }
+    }
 
     Column(
         modifier = modifier
@@ -919,6 +932,57 @@ fun AccessibilityScreen(modifier: Modifier = Modifier) {
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Button(
+            onClick = {
+                context.startService(
+                    Intent(context, LauncherAccessibilityService::class.java).apply {
+                        action = LauncherAccessibilityService.ACTION_START_AUTOMATION
+                        putExtra(
+                            LauncherAccessibilityService.EXTRA_AUTOMATION_MODE,
+                            AutomationMode.COLLECT_AWARDS.wireValue,
+                        )
+                        putExtra(LauncherAccessibilityService.EXTRA_TARGET_LABEL, "携程旅行")
+                        putExtra(
+                            LauncherAccessibilityService.EXTRA_TASK_TITLE_PREFIX,
+                            "星球号内容点赞",
+                        )
+                    }
+                )
+            },
+            enabled = activeMode == null,
+            modifier = Modifier.fillMaxWidth().height(56.dp),
+        ) {
+            Text("Start 星球号内容点赞 Only")
+        }
+        Text(
+            text = if (activeMode == null) {
+                "Runs only the 星球号内容点赞 task and skips reward collection and other task rows."
+            } else {
+                "${activeMode?.displayName} is running"
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        )
+
+        Text(
+            text = "今日已点赞作者 (${likedPlanetAuthors.size})",
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.fillMaxWidth().padding(top = 16.dp),
+        )
+        Text(
+            text = if (likedPlanetAuthors.isEmpty()) {
+                "暂无已确认点赞的作者"
+            } else {
+                likedPlanetAuthors.joinToString(separator = "\n") { "• $it" }
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
         )
 
         HorizontalDivider(modifier = Modifier.padding(vertical = 24.dp))

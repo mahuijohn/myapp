@@ -44,7 +44,6 @@ import android.Manifest
 import androidx.core.content.ContextCompat
 import androidx.core.app.NotificationCompat
 import java.text.Normalizer
-import java.time.LocalDate
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -122,6 +121,8 @@ class LauncherAccessibilityService : AccessibilityService() {
     private var targetPackageName: String? = null
     private var targetLabel: String? = null
     private var activeAutomationMode: AutomationMode? = null
+    /** Optional run-wide task title scope used by dedicated UI entry points. */
+    private var taskTitlePrefixFilter: String? = null
     /** Invalidates delayed callbacks from an earlier Unlike & Unfollow diagnostic run. */
     private var unlikeUnfollowToken = 0L
     private val actionLog = mutableListOf<String>()
@@ -239,6 +240,7 @@ class LauncherAccessibilityService : AccessibilityService() {
         IDLE,
         WAITING_FOR_FEED,
         SETTLING_FEED,
+        WAITING_FOR_SCROLL_REFRESH,
         VERIFYING_DETAIL,
         LIKING,
         VERIFYING_LIKE,
@@ -260,12 +262,6 @@ class LauncherAccessibilityService : AccessibilityService() {
     private var planetContentLikeRequiredNewLikes = PLANET_CONTENT_LIKE_TARGET_COUNT
     private var planetContentLikeCycleEpochDay = 0L
     private var planetContentLikePersistedAuthorCount = 0
-    private val planetContentLikeProgressPrefs by lazy {
-        applicationContext.getSharedPreferences(
-            PLANET_CONTENT_LIKE_PROGRESS_PREFS,
-            Context.MODE_PRIVATE,
-        )
-    }
     private var planetContentLikeScrolls = 0
     private var planetContentLikeNoMoveScrolls = 0
     private var planetContentLikeLastVisibleSignature: Set<String> = emptySet()
@@ -329,6 +325,7 @@ class LauncherAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         serviceConnected = true
         AutomationSettings.init(this)
+        PlanetLikeProgressStore.init(this)
         serviceInfo = AccessibilityServiceInfo().apply {
             eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                     AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
@@ -368,6 +365,7 @@ class LauncherAccessibilityService : AccessibilityService() {
             activeAutomationMode = null
             AutomationLog.setActiveMode(null)
         }
+        taskTitlePrefixFilter = null
         mainHandler.removeCallbacksAndMessages(null)
         screenshotExecutor.shutdownNow()
         super.onDestroy()
@@ -1320,6 +1318,9 @@ class LauncherAccessibilityService : AccessibilityService() {
                         AutomationLog.append("Failed: unknown automation mode")
                         return@let
                     }
+                    val taskTitlePrefix = it.getStringExtra(EXTRA_TASK_TITLE_PREFIX)
+                        ?.trim()
+                        ?.takeIf(String::isNotEmpty)
                     if (runActive) {
                         logProgress(
                             "Ignored ${mode.displayName} start: " +
@@ -1327,7 +1328,7 @@ class LauncherAccessibilityService : AccessibilityService() {
                         )
                         return@let
                     }
-                    startSequentialTasksForLabel(label, mode)
+                    startSequentialTasksForLabel(label, mode, taskTitlePrefix)
                 }
                 // Backward-compatible entry for older installed UI builds.
                 ACTION_OPEN_LAST_APP -> {
@@ -1360,6 +1361,7 @@ class LauncherAccessibilityService : AccessibilityService() {
     fun startSequentialTasksForLabel(
         label: String,
         mode: AutomationMode = AutomationMode.COLLECT_AWARDS,
+        taskTitlePrefix: String? = null,
     ) {
         if (runActive) {
             logProgress("Ignored ${mode.displayName} start because an automation is already running")
@@ -1369,6 +1371,9 @@ class LauncherAccessibilityService : AccessibilityService() {
         targetPackageName = null
         targetLabel = label
         activeAutomationMode = mode
+        taskTitlePrefixFilter = taskTitlePrefix
+            ?.trim()
+            ?.takeIf { mode == AutomationMode.COLLECT_AWARDS && it.isNotEmpty() }
         unlikeUnfollowToken++
         resetUnlikeUnfollowManualState()
         // reset interruption tracking
@@ -1402,7 +1407,8 @@ class LauncherAccessibilityService : AccessibilityService() {
         // Announce the run in the append-only log (no toast/notification popup that would cover the
         // screen while the user watches the automation run).
         AutomationLog.setActiveMode(mode)
-        AutomationLog.startRun("${mode.displayName} · $label")
+        val runScopeLabel = taskTitlePrefixFilter?.let { " · only $it" }.orEmpty()
+        AutomationLog.startRun("${mode.displayName} · $label$runScopeLabel")
         currentTaskTitle = null
         resetMiniProgramSession()
         planetFollowState = PlanetFollowState.IDLE
@@ -3520,21 +3526,34 @@ class LauncherAccessibilityService : AccessibilityService() {
                     )
                 }
             }
-            logProgress("On $TASK_PAGE_TITLE; returning to the top before collecting pending awards")
+            val topPurpose = if (isTaskOnlyRun()) {
+                "scanning the scoped task"
+            } else {
+                "collecting pending awards"
+            }
+            logProgress("On $TASK_PAGE_TITLE; returning to the top before $topPurpose")
             taskScrolls = 0
             lastPageSignature = emptySet()
             scrollToPageTop {
                 if (!manualInterruptionDetected && runActive &&
                     taskLoopPhase == TaskLoopPhase.SCANNING
                 ) {
-                    // Start the bounded claim budget only after top normalization. A restored task
-                    // page can be many screens down, and scrolling must not consume the claim window.
-                    val claimStartedAt = SystemClock.uptimeMillis()
-                    logProgress("At the top of $TASK_PAGE_TITLE; collecting anything already waiting")
-                    mainHandler.postDelayed(
-                        { collectPendingAwards(startedAtMs = claimStartedAt) },
-                        randomDelay(CLAIM_FIRST_LOOK_MIN_MS, CLAIM_FIRST_LOOK_MAX_MS)
-                    )
+                    if (isTaskOnlyRun()) {
+                        logProgress(
+                            "At the top of $TASK_PAGE_TITLE; scanning only for " +
+                                    "'${taskTitlePrefixFilter.orEmpty()}'"
+                        )
+                        processNextTask()
+                    } else {
+                        // Start the bounded claim budget only after top normalization. A restored task
+                        // page can be many screens down, and scrolling must not consume the claim window.
+                        val claimStartedAt = SystemClock.uptimeMillis()
+                        logProgress("At the top of $TASK_PAGE_TITLE; collecting anything already waiting")
+                        mainHandler.postDelayed(
+                            { collectPendingAwards(startedAtMs = claimStartedAt) },
+                            randomDelay(CLAIM_FIRST_LOOK_MIN_MS, CLAIM_FIRST_LOOK_MAX_MS)
+                        )
+                    }
                 }
             }
             return
@@ -4260,6 +4279,14 @@ class LauncherAccessibilityService : AccessibilityService() {
         val titleTop: Int,
     )
 
+    private fun taskRowAllowedByRunScope(row: TaskRow): Boolean {
+        val prefix = taskTitlePrefixFilter ?: return true
+        return row.title.trim().startsWith(prefix)
+    }
+
+    private fun isTaskOnlyRun(): Boolean =
+        activeAutomationMode == AutomationMode.COLLECT_AWARDS && taskTitlePrefixFilter != null
+
     /**
      * Works the task list from the full exposed hierarchy while preserving visible-only clicks.
      * Direct show-on-screen requests avoid blind page-by-page discovery; controlled drags remain the
@@ -4295,17 +4322,21 @@ class LauncherAccessibilityService : AccessibilityService() {
         val rows = buildTaskRows(allTexts.filter { isBoundsVisible(it.bounds) })
         val allRows = buildTaskRows(allTexts)
         val actionable = rows.filter {
-            ACTION_BUTTON_RE.matches(it.buttonText) &&
+            taskRowAllowedByRunScope(it) &&
+                    ACTION_BUTTON_RE.matches(it.buttonText) &&
                     !isIgnoredRow(it) &&
                     it.title !in processedTasks
         }
         val allActionable = allRows.filter {
-            ACTION_BUTTON_RE.matches(it.buttonText) &&
+            taskRowAllowedByRunScope(it) &&
+                    ACTION_BUTTON_RE.matches(it.buttonText) &&
                     !isIgnoredRow(it) &&
                     it.title !in processedTasks
         }
-        val finished = allRows.filter { it.buttonText in SKIP_BUTTON_TEXTS }
-        val ignored = allRows.filter { isIgnoredRow(it) }
+        val finished = allRows.filter {
+            taskRowAllowedByRunScope(it) && it.buttonText in SKIP_BUTTON_TEXTS
+        }
+        val ignored = allRows.filter { taskRowAllowedByRunScope(it) && isIgnoredRow(it) }
         if (attempt == 1 && allRows.isNotEmpty()) {
             logProgress(
                 "Task hierarchy: ${allRows.size} row(s), ${allActionable.size} supported unfinished; " +
@@ -4438,6 +4469,11 @@ class LauncherAccessibilityService : AccessibilityService() {
         // screen is recoverable, so try that before writing the run off. A normal completion happens
         // inside Ctrip, so this cannot cut one short.
         if (rescueFromLauncherHome(reason)) return
+
+        if (isTaskOnlyRun()) {
+            completeTaskLoop("task-only scan complete — $reason")
+            return
+        }
 
         if (!allowClaimRescan || foregroundPackage() != targetPackageName) {
             completeTaskLoop(reason)
@@ -5003,6 +5039,29 @@ class LauncherAccessibilityService : AccessibilityService() {
         val coverBounds: Rect,
     )
 
+    private data class PlanetFeedSnapshot(
+        val targets: List<PlanetFeedCardTarget>,
+        val targetSignature: Set<String>,
+    ) {
+        fun nextSelectable(
+            attemptedCards: Set<String>,
+            consumedAuthors: Set<String>,
+        ): PlanetFeedCardTarget? = targets.firstOrNull {
+            it.key !in attemptedCards && it.authorKey !in consumedAuthors
+        }
+    }
+
+    private fun planetFeedSnapshot(root: AccessibilityNodeInfo): PlanetFeedSnapshot {
+        val targets = findPlanetFeedCardTargets(root)
+        return PlanetFeedSnapshot(
+            targets = targets,
+            targetSignature = targets.map {
+                "${it.key}@${it.coverBounds.left},${it.coverBounds.top}," +
+                        "${it.coverBounds.right},${it.coverBounds.bottom}"
+            }.toSet(),
+        )
+    }
+
     private fun resetPlanetContentLikeSession() {
         planetContentLikeToken++
         planetContentLikeState = PlanetContentLikeState.IDLE
@@ -5036,49 +5095,30 @@ class LauncherAccessibilityService : AccessibilityService() {
         planetContentLikePersistedAuthorCount = persisted.size
     }
 
-    private fun planetContentLikeProgressKey(epochDay: Long): String =
-        "$PLANET_CONTENT_LIKE_PROGRESS_KEY_PREFIX$epochDay"
+    private fun loadPersistedPlanetLikeAuthors(epochDay: Long): Set<String> =
+        PlanetLikeProgressStore.authorKeysForDay(epochDay)
 
-    private fun loadPersistedPlanetLikeAuthors(epochDay: Long): Set<String> {
-        val activeKey = planetContentLikeProgressKey(epochDay)
-        val persisted = planetContentLikeProgressPrefs
-            .getStringSet(activeKey, emptySet())
-            .orEmpty()
-            .toSet()
-        // This task is daily. Date-qualified keys make failover durable without carrying yesterday's
-        // author exclusions into a fresh 0/30 cycle.
-        val staleKeys = planetContentLikeProgressPrefs.all.keys.filter {
-            it.startsWith(PLANET_CONTENT_LIKE_PROGRESS_KEY_PREFIX) && it != activeKey
-        }
-        if (staleKeys.isNotEmpty()) {
-            planetContentLikeProgressPrefs.edit().apply {
-                staleKeys.forEach(::remove)
-            }.apply()
-        }
-        return persisted
-    }
-
-    private fun currentPlanetContentLikeEpochDay(): Long = LocalDate.now().toEpochDay()
+    private fun currentPlanetContentLikeEpochDay(): Long =
+        PlanetLikeProgressStore.currentEpochDay()
 
     private fun planetContentLikeCycleChanged(): Boolean =
         planetContentLikeCycleEpochDay > 0L &&
                 currentPlanetContentLikeEpochDay() != planetContentLikeCycleEpochDay
 
-    private fun persistCompletedPlanetLikeAuthor(authorKey: String): Boolean {
+    private fun persistCompletedPlanetLikeAuthor(
+        authorKey: String,
+        displayName: String,
+    ): Boolean {
         val currentEpochDay = currentPlanetContentLikeEpochDay()
         if (planetContentLikeCycleEpochDay <= 0L) return false
         val cycleChanged = currentEpochDay != planetContentLikeCycleEpochDay
         // If midnight landed between dispatch and verification, store the author in the new cycle so
         // the restarted task cannot click it twice, then stop the stale title-derived attempt.
-        val key = planetContentLikeProgressKey(currentEpochDay)
-        val updated = planetContentLikeProgressPrefs
-            .getStringSet(key, emptySet())
-            .orEmpty()
-            .toMutableSet()
-        if (updated.add(authorKey)) {
-            planetContentLikeProgressPrefs.edit().putStringSet(key, updated.toSet()).apply()
-            planetContentLikePersistedAuthorCount = updated.size
-        }
+        planetContentLikePersistedAuthorCount = PlanetLikeProgressStore.recordVerifiedAuthor(
+            epochDay = currentEpochDay,
+            canonicalKey = authorKey,
+            displayName = displayName,
+        )
         return cycleChanged
     }
 
@@ -5142,11 +5182,8 @@ class LauncherAccessibilityService : AccessibilityService() {
             return
         }
 
-        val targets = findPlanetFeedCardTargets(root)
-        val signature = targets.map {
-            "${it.key}@${it.coverBounds.left},${it.coverBounds.top}," +
-                    "${it.coverBounds.right},${it.coverBounds.bottom}"
-        }.toSet()
+        val snapshot = planetFeedSnapshot(root)
+        val signature = snapshot.targetSignature
         val nextStableHits = when {
             signature.isEmpty() -> 0
             signature == previousSignature -> stableHits + 1
@@ -5158,10 +5195,10 @@ class LauncherAccessibilityService : AccessibilityService() {
                 finishPlanetContentLikeTask(token)
                 return
             }
-            val selected = targets.firstOrNull {
-                it.key !in attemptedPlanetLikeCards &&
-                        it.authorKey !in consumedPlanetLikeAuthors
-            }
+            val selected = snapshot.nextSelectable(
+                attemptedPlanetLikeCards,
+                consumedPlanetLikeAuthors,
+            )
             if (selected != null) {
                 if (attemptedPlanetLikeCards.size >= PLANET_CONTENT_LIKE_MAX_CARDS) {
                     failPlanetContentLikeTask(
@@ -5200,44 +5237,11 @@ class LauncherAccessibilityService : AccessibilityService() {
                 return
             }
 
-            val visibleSignature = targets.map { it.key }.toSet()
-            if (visibleSignature == planetContentLikeLastVisibleSignature) {
-                planetContentLikeNoMoveScrolls++
-            } else {
-                planetContentLikeLastVisibleSignature = visibleSignature
+            if (signature != planetContentLikeLastVisibleSignature) {
+                planetContentLikeLastVisibleSignature = signature
                 planetContentLikeNoMoveScrolls = 0
             }
-            if (planetContentLikeNoMoveScrolls >= PLANET_CONTENT_LIKE_NO_MOVE_CONFIRMATIONS) {
-                failPlanetContentLikeTask(
-                    "only ${planetContentLikeProgressLabel()} were confirmed before the feed ended"
-                )
-                return
-            }
-            if (planetContentLikeScrolls >= PLANET_CONTENT_LIKE_MAX_SCROLLS) {
-                failPlanetContentLikeTask(
-                    "reached the $PLANET_CONTENT_LIKE_MAX_SCROLLS-scroll safety limit with " +
-                            planetContentLikeProgressLabel()
-                )
-                return
-            }
-            planetContentLikeScrolls++
-            if (!swipeVertical(
-                    PLANET_CONTENT_LIKE_SCROLL_FROM_FRACTION,
-                    PLANET_CONTENT_LIKE_SCROLL_TO_FRACTION,
-                    PLANET_CONTENT_LIKE_SCROLL_DURATION_MS,
-                )
-            ) {
-                failPlanetContentLikeTask("the 星球号 feed scroll gesture was rejected")
-                return
-            }
-            logProgress(
-                "No new visible author; scrolling for more " +
-                        "($planetContentLikeScrolls/$PLANET_CONTENT_LIKE_MAX_SCROLLS)"
-            )
-            mainHandler.postDelayed(
-                { settlePlanetContentLikeFeed(token) },
-                PLANET_CONTENT_LIKE_SCROLL_SETTLE_MS,
-            )
+            dispatchPlanetContentLikeFeedScroll(token, snapshot)
             return
         }
 
@@ -5260,6 +5264,179 @@ class LauncherAccessibilityService : AccessibilityService() {
                 )
             },
             PLANET_CONTENT_LIKE_POLL_MS,
+        )
+    }
+
+    private fun dispatchPlanetContentLikeFeedScroll(
+        token: Long,
+        baseline: PlanetFeedSnapshot,
+    ) {
+        if (!isPlanetContentLikeCallbackValid(token) ||
+            planetContentLikeState != PlanetContentLikeState.SETTLING_FEED
+        ) return
+        if (planetContentLikeCycleChanged()) {
+            failPlanetContentLikeTask(
+                "the daily cycle changed before feed scroll; restart from the refreshed x/30 title"
+            )
+            return
+        }
+        if (SystemClock.uptimeMillis() >= planetContentLikeDeadlineMs) {
+            failPlanetContentLikeTask(
+                "timed out before feed scroll with ${planetContentLikeProgressLabel()}"
+            )
+            return
+        }
+        if (planetContentLikeTargetReached()) {
+            finishPlanetContentLikeTask(token)
+            return
+        }
+        if (planetContentLikeScrolls >= PLANET_CONTENT_LIKE_MAX_SCROLLS) {
+            failPlanetContentLikeTask(
+                "reached the $PLANET_CONTENT_LIKE_MAX_SCROLLS-scroll safety limit with " +
+                        planetContentLikeProgressLabel()
+            )
+            return
+        }
+
+        planetContentLikeState = PlanetContentLikeState.WAITING_FOR_SCROLL_REFRESH
+        if (!swipeVertical(
+                PLANET_CONTENT_LIKE_SCROLL_FROM_FRACTION,
+                PLANET_CONTENT_LIKE_SCROLL_TO_FRACTION,
+                PLANET_CONTENT_LIKE_SCROLL_DURATION_MS,
+            )
+        ) {
+            failPlanetContentLikeTask("the 星球号 feed scroll gesture was rejected")
+            return
+        }
+        planetContentLikeScrolls++
+        logProgress(
+            "No new visible author; scroll $planetContentLikeScrolls/" +
+                    "$PLANET_CONTENT_LIKE_MAX_SCROLLS dispatched, waiting for lazy-loaded cards"
+        )
+        mainHandler.postDelayed(
+            {
+                waitForPlanetContentLikeFeedAfterScroll(
+                    token = token,
+                    baselineSignature = baseline.targetSignature,
+                )
+            },
+            PLANET_CONTENT_LIKE_SCROLL_SETTLE_MS,
+        )
+    }
+
+    /**
+     * Gives each accepted swipe a full lazy-load window. A swipe counts as no movement only after the
+     * same non-empty geometry-aware card signature remains stable for the complete polling budget.
+     */
+    private fun waitForPlanetContentLikeFeedAfterScroll(
+        token: Long,
+        baselineSignature: Set<String>,
+        attempt: Int = 1,
+        previousSignature: Set<String> = emptySet(),
+        stableHits: Int = 0,
+    ) {
+        if (!isPlanetContentLikeCallbackValid(token) ||
+            planetContentLikeState != PlanetContentLikeState.WAITING_FOR_SCROLL_REFRESH
+        ) return
+        if (planetContentLikeCycleChanged()) {
+            failPlanetContentLikeTask(
+                "the daily cycle changed while loading more cards; " +
+                        "restart from the refreshed x/30 title"
+            )
+            return
+        }
+        val now = SystemClock.uptimeMillis()
+        if (now >= planetContentLikeDeadlineMs) {
+            failPlanetContentLikeTask(
+                "timed out while loading cards after scroll with ${planetContentLikeProgressLabel()}"
+            )
+            return
+        }
+
+        val root = targetAppRoot()?.takeIf { foregroundPackage() == targetPackageName }
+        val feedReady = root != null && hasPlanetContentFeedMarker(root)
+        val snapshot = root?.takeIf { feedReady }?.let(::planetFeedSnapshot)
+        val signature = snapshot?.targetSignature.orEmpty()
+        val readable = feedReady && signature.isNotEmpty()
+        val nextStableHits = if (readable) {
+            if (signature == previousSignature) stableHits + 1 else 1
+        } else {
+            0
+        }
+        val stable = readable && nextStableHits >= PLANET_CONTENT_LIKE_STABLE_SAMPLES
+        val selectable = snapshot?.nextSelectable(
+            attemptedPlanetLikeCards,
+            consumedPlanetLikeAuthors,
+        )
+        val usefulRefresh = stable &&
+                (signature != baselineSignature || selectable != null)
+        if (usefulRefresh) {
+            planetContentLikeLastVisibleSignature = signature
+            planetContentLikeNoMoveScrolls = 0
+            planetContentLikeState = PlanetContentLikeState.SETTLING_FEED
+            logProgress(
+                if (selectable != null) {
+                    "New author cards are stable after scroll; continuing"
+                } else {
+                    "Card bounds changed after scroll; checking the new viewport"
+                }
+            )
+            mainHandler.post {
+                settlePlanetContentLikeFeed(
+                    token = token,
+                    previousSignature = signature,
+                    stableHits = nextStableHits,
+                )
+            }
+            return
+        }
+
+        if (attempt >= PLANET_CONTENT_LIKE_SCROLL_REFRESH_ATTEMPTS) {
+            if (stable && signature == baselineSignature && selectable == null && snapshot != null) {
+                planetContentLikeNoMoveScrolls++
+                if (planetContentLikeNoMoveScrolls >=
+                    PLANET_CONTENT_LIKE_NO_MOVE_CONFIRMATIONS
+                ) {
+                    failPlanetContentLikeTask(
+                        "only ${planetContentLikeProgressLabel()} were confirmed; " +
+                                "the feed stayed unchanged through " +
+                                "$planetContentLikeNoMoveScrolls full lazy-load window(s)"
+                    )
+                    return
+                }
+                planetContentLikeState = PlanetContentLikeState.SETTLING_FEED
+                logProgress(
+                    "Feed remained unchanged after the full lazy-load wait; " +
+                            "trying one more scroll before declaring exhaustion"
+                )
+                dispatchPlanetContentLikeFeedScroll(token, snapshot)
+                return
+            }
+            root?.let {
+                dumpWindowForDiagnostics(
+                    it,
+                    "星球号 feed did not become readable and stable after scroll",
+                    force = true,
+                )
+            }
+            failPlanetContentLikeTask(
+                "the feed did not become readable and stable after waiting for lazy-loaded cards"
+            )
+            return
+        }
+
+        val remaining = (planetContentLikeDeadlineMs - now).coerceAtLeast(0L)
+        mainHandler.postDelayed(
+            {
+                waitForPlanetContentLikeFeedAfterScroll(
+                    token = token,
+                    baselineSignature = baselineSignature,
+                    attempt = attempt + 1,
+                    previousSignature = signature,
+                    stableHits = nextStableHits,
+                )
+            },
+            minOf(PLANET_CONTENT_LIKE_POLL_MS, remaining),
         )
     }
 
@@ -5529,7 +5706,7 @@ class LauncherAccessibilityService : AccessibilityService() {
                 hasLikedSemantic(current.labels)
         if (countIncreased || selectionSet || semanticSet) {
             val cycleChanged = if (completedPlanetLikeAuthors.add(card.authorKey)) {
-                persistCompletedPlanetLikeAuthor(card.authorKey)
+                persistCompletedPlanetLikeAuthor(card.authorKey, card.authorName)
             } else {
                 false
             }
@@ -8200,6 +8377,7 @@ class LauncherAccessibilityService : AccessibilityService() {
         AutomationLog.endRun("${finishingMode?.displayName ?: "Automation"} finished")
         AutomationLog.setActiveMode(null)
         activeAutomationMode = null
+        taskTitlePrefixFilter = null
         shouldClickElement = false
         targetLabel = null
         targetPackageName = null
@@ -8393,9 +8571,6 @@ class LauncherAccessibilityService : AccessibilityService() {
         private val PLANET_CONTENT_LIKE_COUNTER_HINT_RE = Regex(
             "(?:\\d+|[xX])\\s*[/／]\\s*\\d+"
         )
-        private const val PLANET_CONTENT_LIKE_PROGRESS_PREFS =
-            "planet_content_like_progress"
-        private const val PLANET_CONTENT_LIKE_PROGRESS_KEY_PREFIX = "authors_"
         private const val PLANET_CONTENT_LIKE_AUTHOR_BADGE = "官方旗舰店"
         private const val PLANET_CONTENT_LIKE_PAGE_MARKER_PREFIX = "携程星球号旅游旗舰店"
         private const val PLANET_CONTENT_LIKE_TIMEOUT_MS = 10 * 60_000L
@@ -8418,6 +8593,8 @@ class LauncherAccessibilityService : AccessibilityService() {
         private const val PLANET_CONTENT_LIKE_SCROLL_TO_FRACTION = 0.28f
         private const val PLANET_CONTENT_LIKE_SCROLL_DURATION_MS = 650L
         private const val PLANET_CONTENT_LIKE_SCROLL_SETTLE_MS = 900L
+        // Initial 900ms settle plus eleven 500ms polls gives lazy WebViews about 6.4s per swipe.
+        private const val PLANET_CONTENT_LIKE_SCROLL_REFRESH_ATTEMPTS = 12
         private const val PLANET_CONTENT_LIKE_AUTHOR_MIN_LENGTH = 2
         private const val PLANET_CONTENT_LIKE_AUTHOR_MAX_LENGTH = 40
         private const val PLANET_CONTENT_LIKE_AUTHOR_MAX_WIDTH_FRACTION = 0.42f
@@ -8733,5 +8910,6 @@ class LauncherAccessibilityService : AccessibilityService() {
             "com.example.myapplication.ACTION_HIDE_DUMP_TOOL"
         const val EXTRA_AUTOMATION_MODE = "automation_mode"
         const val EXTRA_TARGET_LABEL = "target_label"
+        const val EXTRA_TASK_TITLE_PREFIX = "task_title_prefix"
     }
 }
