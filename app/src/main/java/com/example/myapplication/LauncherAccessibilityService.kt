@@ -3204,16 +3204,15 @@ class LauncherAccessibilityService : AccessibilityService() {
 
     /** Strong proof of the final 签到任务 list, deliberately excluding 携程会员签到. */
     private fun isVerifiedTaskPage(root: AccessibilityNodeInfo, texts: List<TextNode>): Boolean {
-        val taskListRootVisible = findNodeByViewId(root, TASK_LIST_PAGE_ID) != null
         val exactTitleVisible = texts.any { it.text.trim() == TASK_PAGE_TITLE }
         val normalizedTexts = texts.map { cjkOnly(it.text) }
         val visibleTaskTabs = TASK_GROUP_NAMES_CJK.count { name ->
             normalizedTexts.any { it.contains(name) }
         }
-        // A transitioned WebView can retain the source page ID/button in its accessibility subtree.
-        // Strong destination evidence must win over those stale markers; the source page itself does
-        // not expose the task-list ID plus title or at least three distinct task-group names.
-        if ((taskListRootVisible && exactTitleVisible) || visibleTaskTabs >= 3) return true
+        // During navigation the destination title can become visible before the task-list WebView ID
+        // and all tabs attach. The exact title is sufficient: the source page is 携程会员签到 and its
+        // bottom navigation exposes 签到 and 任务 as separate nodes, never exact 签到任务.
+        if (exactTitleVisible || visibleTaskTabs >= 3) return true
         if (isOnPreTaskEntryPage(root, texts)) return false
         return false
     }
@@ -8420,7 +8419,6 @@ class LauncherAccessibilityService : AccessibilityService() {
         private const val STARTUP_BACK_SETTLE_MAX_MS = 1_200
         private const val TASK_ENTRY_SOURCE_PAGE_TITLE = "携程会员签到"
         private const val TASK_ENTRY_SOURCE_PAGE_ID = "LEGAO-membersignin2021"
-        private const val TASK_LIST_PAGE_ID = "LEGAO-task_list"
         private const val TASK_ENTRY_BUTTON_TEXT = "做任务赚积分"
         private val TASK_ENTRY_PAGE_MARKERS = listOf(
             TASK_ENTRY_BUTTON_TEXT, "最高赚", "立即赚更多"
