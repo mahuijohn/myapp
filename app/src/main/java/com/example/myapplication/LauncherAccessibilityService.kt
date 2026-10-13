@@ -266,6 +266,8 @@ class LauncherAccessibilityService : AccessibilityService() {
     private var planetContentLikePersistedAuthorCount = 0
     private var planetContentLikeScrolls = 0
     private var planetContentLikeNoMoveScrolls = 0
+    /** Reverse gestures used only to recover from Ctrip's clipped-above WebView geometry. */
+    private var planetContentLikeUnreadableBackoffs = 0
     private var planetContentLikeLastVisibleSignature: Set<String> = emptySet()
     private var planetContentLikeAmbiguousCount = 0
     private var planetContentLikeUnsupportedCount = 0
@@ -5105,6 +5107,7 @@ class LauncherAccessibilityService : AccessibilityService() {
         planetContentLikePersistedAuthorCount = 0
         planetContentLikeScrolls = 0
         planetContentLikeNoMoveScrolls = 0
+        planetContentLikeUnreadableBackoffs = 0
         planetContentLikeLastVisibleSignature = emptySet()
         planetContentLikeAmbiguousCount = 0
         planetContentLikeUnsupportedCount = 0
@@ -5440,17 +5443,30 @@ class LauncherAccessibilityService : AccessibilityService() {
                 dispatchPlanetContentLikeFeedScroll(token, snapshot)
                 return
             }
-            if (feedReady && snapshot != null && !readable) {
-                // Ctrip can keep rendering visible cards while exposing every card rectangle as
-                // clipped/inverted (for example [x,0][x,-627]). That is not evidence that scrolling
-                // stopped. The page marker makes another feed swipe safe, and the dispatcher's
-                // existing deadline/60-scroll guards keep this recovery bounded.
+            if (feedReady && root != null && snapshot != null && !readable &&
+                hasClippedAbovePlanetFeedContent(root) &&
+                planetContentLikeUnreadableBackoffs < PLANET_CONTENT_LIKE_MAX_UNREADABLE_BACKOFFS
+            ) {
+                if (!swipeVertical(
+                        PLANET_CONTENT_LIKE_BACKOFF_FROM_FRACTION,
+                        PLANET_CONTENT_LIKE_BACKOFF_TO_FRACTION,
+                        PLANET_CONTENT_LIKE_SCROLL_DURATION_MS,
+                    )
+                ) {
+                    failPlanetContentLikeTask("the clipped-feed recovery gesture was rejected")
+                    return
+                }
+                planetContentLikeUnreadableBackoffs++
                 planetContentLikeState = PlanetContentLikeState.SETTLING_FEED
                 logProgress(
-                    "Feed remained visible but card geometry stayed unreadable; " +
-                            "continuing with the next bounded scroll"
+                    "Card rows were clipped above the viewport; reverse backoff " +
+                            "$planetContentLikeUnreadableBackoffs/" +
+                            "$PLANET_CONTENT_LIKE_MAX_UNREADABLE_BACKOFFS dispatched"
                 )
-                dispatchPlanetContentLikeFeedScroll(token, snapshot)
+                mainHandler.postDelayed(
+                    { settlePlanetContentLikeFeed(token) },
+                    PLANET_CONTENT_LIKE_SCROLL_SETTLE_MS,
+                )
                 return
             }
             root?.let {
@@ -5594,6 +5610,20 @@ class LauncherAccessibilityService : AccessibilityService() {
         collectTextNodes(root).any {
             it.text.trim().startsWith(PLANET_CONTENT_LIKE_PAGE_MARKER_PREFIX)
         }
+
+    /**
+     * True when Ctrip still exposes populated masonry rows, but clips every row above y=0.
+     * This is overscroll evidence, not a loading signal; only a reverse gesture can restore bounds.
+     */
+    private fun hasClippedAbovePlanetFeedContent(root: AccessibilityNodeInfo): Boolean {
+        val screenMidpoint = resources.displayMetrics.widthPixels / 2
+        val clippedBadges = collectTextNodes(root, includeOffscreen = true)
+            .filter { it.text.trim() == PLANET_CONTENT_LIKE_AUTHOR_BADGE }
+            .filter { it.bounds.top <= 0 && it.bounds.bottom < 0 }
+        return clippedBadges.size >= PLANET_CONTENT_LIKE_MIN_CLIPPED_BADGES &&
+                clippedBadges.any { it.bounds.centerX() < screenMidpoint } &&
+                clippedBadges.any { it.bounds.centerX() >= screenMidpoint }
+    }
 
     /**
      * Resolves the concrete reaction slots exposed by the task destination samples.
@@ -8706,10 +8736,18 @@ class LauncherAccessibilityService : AccessibilityService() {
         private const val PLANET_CONTENT_LIKE_MAX_CARDS = 120
         private const val PLANET_CONTENT_LIKE_MAX_SCROLLS = 60
         private const val PLANET_CONTENT_LIKE_NO_MOVE_CONFIRMATIONS = 2
-        private const val PLANET_CONTENT_LIKE_SCROLL_FROM_FRACTION = 0.82f
-        private const val PLANET_CONTENT_LIKE_SCROLL_TO_FRACTION = 0.28f
+        // Keep overlap between ~960px masonry rows; the previous 0.54-screen drag could jump past
+        // the last accessibility-exposed row and leave every card clipped above the viewport.
+        private const val PLANET_CONTENT_LIKE_SCROLL_FROM_FRACTION = 0.72f
+        private const val PLANET_CONTENT_LIKE_SCROLL_TO_FRACTION = 0.47f
         private const val PLANET_CONTENT_LIKE_SCROLL_DURATION_MS = 650L
         private const val PLANET_CONTENT_LIKE_SCROLL_SETTLE_MS = 900L
+        // A full reverse drag restores roughly 1296px on a 2400px display, enough to bring dump 54's
+        // last row (bottom around -630px) back into the clickable viewport.
+        private const val PLANET_CONTENT_LIKE_BACKOFF_FROM_FRACTION = 0.28f
+        private const val PLANET_CONTENT_LIKE_BACKOFF_TO_FRACTION = 0.82f
+        private const val PLANET_CONTENT_LIKE_MAX_UNREADABLE_BACKOFFS = 2
+        private const val PLANET_CONTENT_LIKE_MIN_CLIPPED_BADGES = 2
         // Initial 900ms settle plus eleven 500ms polls gives lazy WebViews about 6.4s per swipe.
         private const val PLANET_CONTENT_LIKE_SCROLL_REFRESH_ATTEMPTS = 12
         private const val PLANET_CONTENT_LIKE_AUTHOR_MIN_LENGTH = 2
