@@ -266,8 +266,10 @@ class LauncherAccessibilityService : AccessibilityService() {
     private var planetContentLikePersistedAuthorCount = 0
     private var planetContentLikeScrolls = 0
     private var planetContentLikeNoMoveScrolls = 0
-    /** Reverse gestures used only to recover from Ctrip's clipped-above WebView geometry. */
-    private var planetContentLikeUnreadableBackoffs = 0
+    /** Off-screen card identity currently being materialized via ACTION_SHOW_ON_SCREEN. */
+    private var planetContentLikePendingRevealKey: String? = null
+    private var planetContentLikePendingRevealAnchor = 0
+    private val planetContentLikeUnrevealableCards = mutableSetOf<String>()
     private var planetContentLikeLastVisibleSignature: Set<String> = emptySet()
     private var planetContentLikeAmbiguousCount = 0
     private var planetContentLikeUnsupportedCount = 0
@@ -5068,6 +5070,16 @@ class LauncherAccessibilityService : AccessibilityService() {
         val coverBounds: Rect,
     )
 
+    /** Planning-only off-screen group. Its nodes may receive SHOW_ON_SCREEN, never a click. */
+    private data class PlanetFeedRevealTarget(
+        val key: String,
+        val authorKey: String,
+        val authorName: String,
+        val title: String,
+        val anchors: List<AccessibilityNodeInfo>,
+        val coverBottom: Int,
+    )
+
     private data class PlanetFeedSnapshot(
         val targets: List<PlanetFeedCardTarget>,
         val targetSignature: Set<String>,
@@ -5107,7 +5119,9 @@ class LauncherAccessibilityService : AccessibilityService() {
         planetContentLikePersistedAuthorCount = 0
         planetContentLikeScrolls = 0
         planetContentLikeNoMoveScrolls = 0
-        planetContentLikeUnreadableBackoffs = 0
+        planetContentLikePendingRevealKey = null
+        planetContentLikePendingRevealAnchor = 0
+        planetContentLikeUnrevealableCards.clear()
         planetContentLikeLastVisibleSignature = emptySet()
         planetContentLikeAmbiguousCount = 0
         planetContentLikeUnsupportedCount = 0
@@ -5226,10 +5240,19 @@ class LauncherAccessibilityService : AccessibilityService() {
                 finishPlanetContentLikeTask(token)
                 return
             }
-            val selected = snapshot.nextSelectable(
-                attemptedPlanetLikeCards,
-                consumedPlanetLikeAuthors,
-            )
+            val pendingRevealKey = planetContentLikePendingRevealKey
+            val selected = if (pendingRevealKey == null) {
+                snapshot.nextSelectable(
+                    attemptedPlanetLikeCards,
+                    consumedPlanetLikeAuthors,
+                )
+            } else {
+                snapshot.targets.firstOrNull {
+                    it.key == pendingRevealKey &&
+                            it.key !in attemptedPlanetLikeCards &&
+                            it.authorKey !in consumedPlanetLikeAuthors
+                }
+            }
             if (selected != null) {
                 if (attemptedPlanetLikeCards.size >= PLANET_CONTENT_LIKE_MAX_CARDS) {
                     failPlanetContentLikeTask(
@@ -5238,6 +5261,8 @@ class LauncherAccessibilityService : AccessibilityService() {
                     )
                     return
                 }
+                planetContentLikePendingRevealKey = null
+                planetContentLikePendingRevealAnchor = 0
                 attemptedPlanetLikeCards.add(selected.key)
                 consumedPlanetLikeAuthors.add(selected.authorKey)
                 planetContentLikeLastVisibleSignature = emptySet()
@@ -5268,6 +5293,14 @@ class LauncherAccessibilityService : AccessibilityService() {
                 return
             }
 
+            if (pendingRevealKey != null) {
+                if (requestPlanetFeedCardReveal(token, root)) return
+                failPlanetContentLikeTask(
+                    "could not materialize the planned 星球号 card '$pendingRevealKey'"
+                )
+                return
+            }
+
             if (signature != planetContentLikeLastVisibleSignature) {
                 planetContentLikeLastVisibleSignature = signature
                 planetContentLikeNoMoveScrolls = 0
@@ -5275,6 +5308,11 @@ class LauncherAccessibilityService : AccessibilityService() {
             dispatchPlanetContentLikeFeedScroll(token, snapshot)
             return
         }
+
+        if (feedMarkerVisible && signature.isEmpty() &&
+            attempt >= PLANET_CONTENT_LIKE_REVEAL_TRIGGER_POLLS &&
+            requestPlanetFeedCardReveal(token, root)
+        ) return
 
         if (attempt >= PLANET_CONTENT_LIKE_FEED_SETTLE_ATTEMPTS) {
             dumpWindowForDiagnostics(
@@ -5443,31 +5481,10 @@ class LauncherAccessibilityService : AccessibilityService() {
                 dispatchPlanetContentLikeFeedScroll(token, snapshot)
                 return
             }
-            if (feedReady && root != null && snapshot != null && !readable &&
-                hasClippedAbovePlanetFeedContent(root) &&
-                planetContentLikeUnreadableBackoffs < PLANET_CONTENT_LIKE_MAX_UNREADABLE_BACKOFFS
-            ) {
-                if (!swipeVertical(
-                        PLANET_CONTENT_LIKE_BACKOFF_FROM_FRACTION,
-                        PLANET_CONTENT_LIKE_BACKOFF_TO_FRACTION,
-                        PLANET_CONTENT_LIKE_SCROLL_DURATION_MS,
-                    )
-                ) {
-                    failPlanetContentLikeTask("the clipped-feed recovery gesture was rejected")
-                    return
-                }
-                planetContentLikeUnreadableBackoffs++
+            if (feedReady && root != null && snapshot != null && !readable) {
                 planetContentLikeState = PlanetContentLikeState.SETTLING_FEED
-                logProgress(
-                    "Card rows were clipped above the viewport; reverse backoff " +
-                            "$planetContentLikeUnreadableBackoffs/" +
-                            "$PLANET_CONTENT_LIKE_MAX_UNREADABLE_BACKOFFS dispatched"
-                )
-                mainHandler.postDelayed(
-                    { settlePlanetContentLikeFeed(token) },
-                    PLANET_CONTENT_LIKE_SCROLL_SETTLE_MS,
-                )
-                return
+                if (requestPlanetFeedCardReveal(token, root)) return
+                planetContentLikeState = PlanetContentLikeState.WAITING_FOR_SCROLL_REFRESH
             }
             root?.let {
                 dumpWindowForDiagnostics(
@@ -5597,6 +5614,159 @@ class LauncherAccessibilityService : AccessibilityService() {
                 .thenBy { it.coverBounds.left })
     }
 
+    /**
+     * Builds planning-only groups from Ctrip's clipped document coordinates.
+     *
+     * Once WebView tops clamp to zero, bottom edges still preserve the row ordering and gaps. These
+     * nodes are never clicked; they are used only to ask Android to materialize one exact card.
+     */
+    private fun findPlanetFeedRevealTargets(root: AccessibilityNodeInfo): List<PlanetFeedRevealTarget> {
+        val width = resources.displayMetrics.widthPixels
+        val texts = collectTextNodes(root, includeOffscreen = true)
+        val clickables = collectClickableInWindow(root)
+        val badges = texts.filter { it.text.trim() == PLANET_CONTENT_LIKE_AUTHOR_BADGE }
+        return badges.mapNotNull { badge ->
+            val badgeOnLeft = badge.bounds.centerX() < width / 2
+            val author = texts.asSequence()
+                .filter { it !== badge && (it.bounds.centerX() < width / 2) == badgeOnLeft }
+                .filter {
+                    runCatching { it.node.isClickable }.getOrDefault(false) &&
+                            it.bounds.width() <= width *
+                            PLANET_CONTENT_LIKE_AUTHOR_MAX_WIDTH_FRACTION
+                }
+                .map { it to normalizePlanetAuthorName(it.text) }
+                .filter { (_, value) ->
+                    value.length in PLANET_CONTENT_LIKE_AUTHOR_MIN_LENGTH..
+                            PLANET_CONTENT_LIKE_AUTHOR_MAX_LENGTH &&
+                            value !in PLANET_CONTENT_LIKE_CHROME_TEXTS
+                }
+                .filter { (node, _) ->
+                    abs(node.bounds.bottom - badge.bounds.bottom) <=
+                            PLANET_CONTENT_LIKE_AUTHOR_Y_TOLERANCE_PX &&
+                            abs(node.bounds.centerX() - badge.bounds.centerX()) <=
+                            width * PLANET_CONTENT_LIKE_AUTHOR_X_TOLERANCE_FRACTION
+                }
+                .minByOrNull { (node, _) ->
+                    abs(node.bounds.bottom - badge.bounds.bottom) * 3 +
+                            abs(node.bounds.centerX() - badge.bounds.centerX())
+                } ?: return@mapNotNull null
+
+            val authorName = normalizePlanetAuthorName(author.second)
+            val authorKey = canonicalPlanetAuthorKey(authorName)
+            val titleNode = texts.asSequence()
+                .filter { it !== badge && it !== author.first }
+                .filter { (it.bounds.centerX() < width / 2) == badgeOnLeft }
+                .filter {
+                    author.first.bounds.bottom - it.bounds.bottom in
+                            -PLANET_CONTENT_LIKE_TITLE_OVERLAP_TOLERANCE_PX..
+                            PLANET_CONTENT_LIKE_TITLE_MAX_GAP_PX
+                }
+                .filter {
+                    horizontalOverlapRatio(it.bounds, author.first.bounds) >=
+                            PLANET_CONTENT_LIKE_TITLE_MIN_OVERLAP
+                }
+                .map { it to normalizeLikedCardTitle(it.text) }
+                .filter { (_, value) ->
+                    value.length >= PLANET_CONTENT_LIKE_TITLE_MIN_LENGTH &&
+                            value !in PLANET_CONTENT_LIKE_CHROME_TEXTS &&
+                            !value.startsWith(PLANET_CONTENT_LIKE_PAGE_MARKER_PREFIX)
+                }
+                .maxByOrNull { (node, _) -> node.bounds.bottom }
+                ?: return@mapNotNull null
+
+            val cover = clickables.asSequence()
+                .filter { (node, _) -> node != titleNode.first.node && node != author.first.node }
+                .filter { (_, bounds) ->
+                    bounds.width().toFloat() / width in
+                            PLANET_CONTENT_LIKE_COVER_MIN_WIDTH_FRACTION..
+                            PLANET_CONTENT_LIKE_COVER_MAX_WIDTH_FRACTION
+                }
+                .filter { (_, bounds) -> (bounds.centerX() < width / 2) == badgeOnLeft }
+                .filter { (_, bounds) ->
+                    titleNode.first.bounds.bottom - bounds.bottom in
+                            -PLANET_CONTENT_LIKE_COVER_OVERLAP_TOLERANCE_PX..
+                            PLANET_CONTENT_LIKE_COVER_TITLE_MAX_GAP_PX
+                }
+                .filter { (_, bounds) ->
+                    horizontalOverlapRatio(bounds, titleNode.first.bounds) >=
+                            PLANET_CONTENT_LIKE_COVER_MIN_OVERLAP
+                }
+                .maxByOrNull { (_, bounds) -> bounds.bottom }
+                ?: return@mapNotNull null
+            val title = titleNode.second
+            PlanetFeedRevealTarget(
+                key = "$authorKey|${title.lowercase(Locale.ROOT)}",
+                authorKey = authorKey,
+                authorName = authorName,
+                title = title,
+                anchors = listOf(cover.first, titleNode.first.node, author.first.node),
+                coverBottom = cover.second.bottom,
+            )
+        }
+            .distinctBy { it.key }
+            .sortedByDescending { it.coverBottom }
+    }
+
+    /** Requests one exact unconsumed card on screen; no off-screen node is ever clicked here. */
+    private fun requestPlanetFeedCardReveal(
+        token: Long,
+        root: AccessibilityNodeInfo,
+    ): Boolean {
+        if (!isPlanetContentLikeCallbackValid(token) ||
+            !hasPlanetContentFeedMarker(root) ||
+            SystemClock.uptimeMillis() >= planetContentLikeDeadlineMs
+        ) return false
+
+        val plans = findPlanetFeedRevealTargets(root)
+        var plan = planetContentLikePendingRevealKey?.let { key ->
+            plans.firstOrNull { it.key == key }
+        }
+        if (plan == null && planetContentLikePendingRevealKey != null) {
+            planetContentLikeUnrevealableCards.add(planetContentLikePendingRevealKey!!)
+            planetContentLikePendingRevealKey = null
+            planetContentLikePendingRevealAnchor = 0
+        }
+        if (plan == null) {
+            plan = plans.firstOrNull {
+                it.key !in attemptedPlanetLikeCards &&
+                        it.authorKey !in consumedPlanetLikeAuthors &&
+                        it.key !in planetContentLikeUnrevealableCards
+            } ?: return false
+            planetContentLikePendingRevealKey = plan.key
+            planetContentLikePendingRevealAnchor = 0
+        }
+
+        while (planetContentLikePendingRevealAnchor < plan.anchors.size) {
+            val anchorIndex = planetContentLikePendingRevealAnchor++
+            val requested = runCatching {
+                plan.anchors[anchorIndex].performAction(
+                    AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id
+                )
+            }.getOrDefault(false)
+            if (requested) {
+                planetContentLikeState = PlanetContentLikeState.SETTLING_FEED
+                logProgress(
+                    "Bringing '${plan.authorName}' card into view " +
+                            "(${anchorIndex + 1}/${plan.anchors.size})"
+                )
+                mainHandler.postDelayed(
+                    { settlePlanetContentLikeFeed(token) },
+                    PLANET_CONTENT_LIKE_SHOW_ON_SCREEN_SETTLE_MS,
+                )
+                return true
+            }
+        }
+
+        planetContentLikeUnrevealableCards.add(plan.key)
+        planetContentLikePendingRevealKey = null
+        planetContentLikePendingRevealAnchor = 0
+        logProgress("Could not reveal '${plan.authorName}' directly; trying another author")
+        if (planetContentLikeUnrevealableCards.size >=
+            PLANET_CONTENT_LIKE_MAX_UNREVEALABLE_CARDS
+        ) return false
+        return requestPlanetFeedCardReveal(token, root)
+    }
+
     private fun normalizePlanetAuthorName(raw: String): String =
         Normalizer.normalize(raw, Normalizer.Form.NFKC)
             .trim()
@@ -5610,20 +5780,6 @@ class LauncherAccessibilityService : AccessibilityService() {
         collectTextNodes(root).any {
             it.text.trim().startsWith(PLANET_CONTENT_LIKE_PAGE_MARKER_PREFIX)
         }
-
-    /**
-     * True when Ctrip still exposes populated masonry rows, but clips every row above y=0.
-     * This is overscroll evidence, not a loading signal; only a reverse gesture can restore bounds.
-     */
-    private fun hasClippedAbovePlanetFeedContent(root: AccessibilityNodeInfo): Boolean {
-        val screenMidpoint = resources.displayMetrics.widthPixels / 2
-        val clippedBadges = collectTextNodes(root, includeOffscreen = true)
-            .filter { it.text.trim() == PLANET_CONTENT_LIKE_AUTHOR_BADGE }
-            .filter { it.bounds.top <= 0 && it.bounds.bottom < 0 }
-        return clippedBadges.size >= PLANET_CONTENT_LIKE_MIN_CLIPPED_BADGES &&
-                clippedBadges.any { it.bounds.centerX() < screenMidpoint } &&
-                clippedBadges.any { it.bounds.centerX() >= screenMidpoint }
-    }
 
     /**
      * Resolves the concrete reaction slots exposed by the task destination samples.
@@ -6001,7 +6157,8 @@ class LauncherAccessibilityService : AccessibilityService() {
         }
         val targets = root?.let(::findPlanetFeedCardTargets).orEmpty()
         val signature = targets.map { it.key }.toSet()
-        val feedVisible = root != null && hasPlanetContentFeedMarker(root) && targets.isNotEmpty()
+        val feedMarkerVisible = root != null && hasPlanetContentFeedMarker(root)
+        val feedVisible = feedMarkerVisible && targets.isNotEmpty()
         val nextStableHits = if (feedVisible) {
             if (signature == previousSignature) stableHits + 1 else 1
         } else {
@@ -6021,6 +6178,13 @@ class LauncherAccessibilityService : AccessibilityService() {
                 )
             }
             return
+        }
+        if (feedMarkerVisible && root != null && targets.isEmpty() &&
+            attempt >= PLANET_CONTENT_LIKE_REVEAL_TRIGGER_POLLS
+        ) {
+            planetContentLikeState = PlanetContentLikeState.SETTLING_FEED
+            if (requestPlanetFeedCardReveal(token, root)) return
+            planetContentLikeState = PlanetContentLikeState.WAITING_FOR_FEED_REFRESH
         }
         if (attempt >= PLANET_CONTENT_LIKE_RETURN_ATTEMPTS ||
             SystemClock.uptimeMillis() >= planetContentLikeDeadlineMs
@@ -8742,12 +8906,9 @@ class LauncherAccessibilityService : AccessibilityService() {
         private const val PLANET_CONTENT_LIKE_SCROLL_TO_FRACTION = 0.47f
         private const val PLANET_CONTENT_LIKE_SCROLL_DURATION_MS = 650L
         private const val PLANET_CONTENT_LIKE_SCROLL_SETTLE_MS = 900L
-        // A full reverse drag restores roughly 1296px on a 2400px display, enough to bring dump 54's
-        // last row (bottom around -630px) back into the clickable viewport.
-        private const val PLANET_CONTENT_LIKE_BACKOFF_FROM_FRACTION = 0.28f
-        private const val PLANET_CONTENT_LIKE_BACKOFF_TO_FRACTION = 0.82f
-        private const val PLANET_CONTENT_LIKE_MAX_UNREADABLE_BACKOFFS = 2
-        private const val PLANET_CONTENT_LIKE_MIN_CLIPPED_BADGES = 2
+        private const val PLANET_CONTENT_LIKE_SHOW_ON_SCREEN_SETTLE_MS = 450L
+        private const val PLANET_CONTENT_LIKE_REVEAL_TRIGGER_POLLS = 3
+        private const val PLANET_CONTENT_LIKE_MAX_UNREVEALABLE_CARDS = 6
         // Initial 900ms settle plus eleven 500ms polls gives lazy WebViews about 6.4s per swipe.
         private const val PLANET_CONTENT_LIKE_SCROLL_REFRESH_ATTEMPTS = 12
         private const val PLANET_CONTENT_LIKE_AUTHOR_MIN_LENGTH = 2
