@@ -250,6 +250,8 @@ class LauncherAccessibilityService : AccessibilityService() {
     }
     private var planetContentLikeState = PlanetContentLikeState.IDLE
     private var planetContentLikeDeadlineMs = 0L
+    /** Window containing the verified detail; Like verification and BACK stay pinned to it. */
+    private var planetContentLikeDetailWindowId: Int? = null
     /** A card is opened at most once; a dispatched toggle is never retried for the same author. */
     private val attemptedPlanetLikeCards = mutableSetOf<String>()
     /** Every selected author is consumed once, regardless of card/control outcome. */
@@ -406,6 +408,32 @@ class LauncherAccessibilityService : AccessibilityService() {
     private fun targetAppRoot(): AccessibilityNodeInfo? {
         val target = targetPackageName ?: return null
         return currentRoots().firstOrNull { it.packageName?.toString() == target }
+    }
+
+    /**
+     * Target-app roots ordered by actual window layer, with rootInActiveWindow only as fallback.
+     * This task-local ranking avoids changing foreground semantics for every other automation flow.
+     */
+    private fun layeredTargetAppRoots(): List<AccessibilityNodeInfo> {
+        val target = targetPackageName ?: return emptyList()
+        val roots = mutableListOf<AccessibilityNodeInfo>()
+        try {
+            for (window in (windows ?: emptyList()).sortedByDescending {
+                runCatching { it.layer }.getOrDefault(0)
+            }) {
+                val root = try { window.root } catch (_: Exception) { null } ?: continue
+                if (root.packageName?.toString() == target && roots.none { it == root }) {
+                    roots.add(root)
+                }
+            }
+        } catch (_: Exception) {}
+        try {
+            rootInActiveWindow
+                ?.takeIf { it.packageName?.toString() == target }
+                ?.takeIf { active -> roots.none { it == active } }
+                ?.let(roots::add)
+        } catch (_: Exception) {}
+        return roots
     }
 
     private fun appRoot(): AccessibilityNodeInfo? {
@@ -5065,6 +5093,7 @@ class LauncherAccessibilityService : AccessibilityService() {
         planetContentLikeToken++
         planetContentLikeState = PlanetContentLikeState.IDLE
         planetContentLikeDeadlineMs = 0L
+        planetContentLikeDetailWindowId = null
         attemptedPlanetLikeCards.clear()
         consumedPlanetLikeAuthors.clear()
         toggledPlanetLikeAuthors.clear()
@@ -5227,7 +5256,7 @@ class LauncherAccessibilityService : AccessibilityService() {
                     return
                 }
                 recordAction(
-                    "Opened 星球号 card '${selected.title}' by '${selected.authorName}'"
+                    "Dispatched 星球号 card tap '${selected.title}' by '${selected.authorName}'"
                 )
                 mainHandler.postDelayed(
                     { settlePlanetContentLikeDetail(token, selected, sourcePageSignature) },
@@ -5567,6 +5596,42 @@ class LauncherAccessibilityService : AccessibilityService() {
         return control.takeIf { it.likeCount != null }
     }
 
+    /**
+     * Finds the actual article/video detail among all readable Ctrip windows.
+     *
+     * Ctrip can leave the feed as rootInActiveWindow while rendering the opened card in a newer
+     * same-package WebView window. Generic targetAppRoot() then describes the feed even though the
+     * detail is what the user sees, so detail-only checks must identify their page semantically.
+     */
+    private fun planetContentLikeDetailRoot(
+        sourcePageSignature: Set<String>? = null,
+        expectedWindowId: Int? = null,
+        requireLikeControl: Boolean = true,
+    ): AccessibilityNodeInfo? {
+        if (foregroundPackage() != targetPackageName) return null
+        val candidates = layeredTargetAppRoots()
+        val eligible = if (expectedWindowId == null) {
+            candidates.asSequence()
+        } else {
+            candidates.asSequence().filter { it.windowId == expectedWindowId }
+        }
+        return eligible.firstOrNull { candidate ->
+            val signature = pageSignature(candidate)
+            if (signature.isEmpty() ||
+                (sourcePageSignature != null && signature == sourcePageSignature) ||
+                hasPlanetContentFeedMarker(candidate) ||
+                !hasUnlikeDetailBackControl(candidate)
+            ) {
+                false
+            } else {
+                // Positive identity matters during discovery: the feed itself has a compact top-left
+                // Back control and its signature changes during lazy rendering. A count-bearing
+                // reaction slot proves this is the actionable detail shown in the screenshot.
+                !requireLikeControl || findPlanetContentLikeControl(candidate) != null
+            }
+        }
+    }
+
     /** Waits for a real card detail and resolves its sampled article/video Like slot. */
     private fun settlePlanetContentLikeDetail(
         token: Long,
@@ -5589,21 +5654,21 @@ class LauncherAccessibilityService : AccessibilityService() {
             failPlanetContentLikeTask("timed out while opening '${card.authorName}'")
             return
         }
-        val root = targetAppRoot()?.takeIf { foregroundPackage() == targetPackageName }
+        val root = planetContentLikeDetailRoot(sourcePageSignature)
         val signature = root?.let(::pageSignature).orEmpty()
-        val detailCandidate = root != null && signature.isNotEmpty() &&
-                signature != sourcePageSignature && !hasPlanetContentFeedMarker(root) &&
-                hasUnlikeDetailBackControl(root)
+        val detailCandidate = root != null
         val nextStableHits = if (detailCandidate) {
             if (signature == previousSignature) stableHits + 1 else 1
         } else {
             0
         }
-        val control = root?.takeIf { detailCandidate }?.let(::findPlanetContentLikeControl)
+        val control = root?.let(::findPlanetContentLikeControl)
         if (control != null &&
             (nextStableHits >= PLANET_CONTENT_LIKE_STABLE_SAMPLES ||
                     attempt >= PLANET_CONTENT_LIKE_DETAIL_MIN_POLLS)
         ) {
+            val detailWindowId = root?.windowId ?: return
+            planetContentLikeDetailWindowId = detailWindowId
             if (control.checkedOrSelected || hasLikedSemantic(control.labels)) {
                 planetContentLikeUnsupportedCount++
                 logProgress(
@@ -5624,7 +5689,7 @@ class LauncherAccessibilityService : AccessibilityService() {
 
         if (attempt >= PLANET_CONTENT_LIKE_DETAIL_SETTLE_ATTEMPTS) {
             planetContentLikeUnsupportedCount++
-            root?.let {
+            (layeredTargetAppRoots().firstOrNull() ?: targetAppRoot())?.let {
                 dumpWindowForDiagnostics(
                     it,
                     "Like control not found for '${card.authorName}' / '${card.title}'",
@@ -5632,7 +5697,12 @@ class LauncherAccessibilityService : AccessibilityService() {
                     maxNodes = MANUAL_DUMP_MAX_NODES,
                 )
             }
-            returnFromPlanetContentLikeDetail(token, card, "no safe article/video like control")
+            // Do not trust a retained feed hierarchy enough to issue feed coordinates or BACK: dump
+            // 43 proves it can disagree with the visible screen. Without a positively identified
+            // detail/count control there is no safe state-changing action.
+            failPlanetContentLikeTask(
+                "the detail/Like control for '${card.authorName}' never became readable"
+            )
             return
         }
         mainHandler.postDelayed(
@@ -5693,7 +5763,9 @@ class LauncherAccessibilityService : AccessibilityService() {
         if (!isPlanetContentLikeCallbackValid(token) ||
             planetContentLikeState != PlanetContentLikeState.VERIFYING_LIKE
         ) return
-        val root = targetAppRoot()?.takeIf { foregroundPackage() == targetPackageName }
+        val root = planetContentLikeDetailWindowId?.let { expectedWindowId ->
+            planetContentLikeDetailRoot(expectedWindowId = expectedWindowId)
+        }
         val current = root?.let(::findPlanetContentLikeControl)
             ?.takeIf { it.variant == before.variant }
         val countIncreased = before.likeCount != null && current?.likeCount != null &&
@@ -5787,8 +5859,9 @@ class LauncherAccessibilityService : AccessibilityService() {
         if (!isPlanetContentLikeCallbackValid(token) ||
             planetContentLikeState != PlanetContentLikeState.VERIFYING_LIKE
         ) return
-        val current = targetAppRoot()
-            ?.takeIf { foregroundPackage() == targetPackageName }
+        val current = planetContentLikeDetailWindowId?.let { expectedWindowId ->
+            planetContentLikeDetailRoot(expectedWindowId = expectedWindowId)
+        }
             ?.let(::findPlanetContentLikeControl)
             ?.takeIf { it.variant == original.variant }
         val countRestored = original.likeCount != null && current?.likeCount != null &&
@@ -5822,6 +5895,34 @@ class LauncherAccessibilityService : AccessibilityService() {
         outcome: String,
     ) {
         if (!isPlanetContentLikeCallbackValid(token)) return
+        val expectedWindowId = planetContentLikeDetailWindowId
+        val detailRoot = expectedWindowId?.let {
+            planetContentLikeDetailRoot(
+                expectedWindowId = it,
+                requireLikeControl = false,
+            )
+        }
+        if (detailRoot == null) {
+            val frontTargetRoot = layeredTargetAppRoots().firstOrNull()
+            if (foregroundPackage() == targetPackageName && frontTargetRoot != null &&
+                hasPlanetContentFeedMarker(frontTargetRoot)
+            ) {
+                // The pinned detail already disappeared and the actual front Ctrip window is the
+                // feed. Do not send an extra BACK that could close Ctrip.
+                planetContentLikeDetailWindowId = null
+                planetContentLikeState = PlanetContentLikeState.WAITING_FOR_FEED_REFRESH
+                logProgress("Returned from '${card.authorName}' ($outcome); feed already visible")
+                mainHandler.postDelayed(
+                    { waitForPlanetContentLikeFeedAfterReturn(token, card) },
+                    PLANET_CONTENT_LIKE_RETURN_SETTLE_MS,
+                )
+            } else {
+                failPlanetContentLikeTask(
+                    "the verified detail window for '${card.authorName}' was no longer actionable"
+                )
+            }
+            return
+        }
         planetContentLikeState = PlanetContentLikeState.RETURNING_TO_FEED
         logProgress("Returning from '${card.authorName}' ($outcome)")
         val accepted = runCatching { performGlobalAction(GLOBAL_ACTION_BACK) }.getOrDefault(false)
@@ -5850,7 +5951,11 @@ class LauncherAccessibilityService : AccessibilityService() {
             )
             return
         }
-        val root = targetAppRoot()?.takeIf { foregroundPackage() == targetPackageName }
+        val root = if (foregroundPackage() == targetPackageName) {
+            layeredTargetAppRoots().firstOrNull()
+        } else {
+            null
+        }
         val targets = root?.let(::findPlanetFeedCardTargets).orEmpty()
         val signature = targets.map { it.key }.toSet()
         val feedVisible = root != null && hasPlanetContentFeedMarker(root) && targets.isNotEmpty()
@@ -5860,6 +5965,7 @@ class LauncherAccessibilityService : AccessibilityService() {
             0
         }
         if (nextStableHits >= PLANET_CONTENT_LIKE_STABLE_SAMPLES) {
+            planetContentLikeDetailWindowId = null
             if (planetContentLikeTargetReached()) {
                 finishPlanetContentLikeTask(token)
             } else {
