@@ -5440,6 +5440,19 @@ class LauncherAccessibilityService : AccessibilityService() {
                 dispatchPlanetContentLikeFeedScroll(token, snapshot)
                 return
             }
+            if (feedReady && snapshot != null && !readable) {
+                // Ctrip can keep rendering visible cards while exposing every card rectangle as
+                // clipped/inverted (for example [x,0][x,-627]). That is not evidence that scrolling
+                // stopped. The page marker makes another feed swipe safe, and the dispatcher's
+                // existing deadline/60-scroll guards keep this recovery bounded.
+                planetContentLikeState = PlanetContentLikeState.SETTLING_FEED
+                logProgress(
+                    "Feed remained visible but card geometry stayed unreadable; " +
+                            "continuing with the next bounded scroll"
+                )
+                dispatchPlanetContentLikeFeedScroll(token, snapshot)
+                return
+            }
             root?.let {
                 dumpWindowForDiagnostics(
                     it,
